@@ -4,3 +4,4 @@ safari-helper
 *.swift
 package-lock.json
 CHANGELOG.md
+index.d.ts
