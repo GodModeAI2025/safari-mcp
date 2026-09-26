@@ -359,6 +359,7 @@ mcporter call safari.safari_snapshot laneId="$PI_SESSION_ID"
 - **Re-claim:** state is keyed by the lane, not the connection. Reconnect with the same `laneId` and you're back on your tab; another lane never inherits it.
 - **Serialized:** calls into the same lane run one at a time, in order. Different lanes still run concurrently.
 - **Fails closed:** a call without a valid `laneId` (`[A-Za-z0-9._:-]`, max 128) is rejected. There is no default lane to fall into.
+- **Idle lanes are released:** a lane that makes no calls for `SAFARI_MCP_LANE_IDLE_MS` (default 1 hour, `0` = never) has its server-side state dropped, so arbitrary lane ids cannot grow the process forever. A lane with a call in flight is never released. Its tab stays open, and the next call with that `laneId` starts fresh.
 
 Works over stdio and HTTP. Off by default, so tool schemas don't change unless you opt in. `test/session-cardinality.test.mjs` asserts these invariants in CI, and also checks that a client-caching runner shows up as a single collapsed session there, not in production.
 

@@ -8,7 +8,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { startTransport } from "./transport.js";
 import { currentSessionId } from "./session-context.js";
-import { lanesEnabled, applyLanes, createLaneQueue } from "./lanes.js";
+import { lanesEnabled, applyLanes, createLaneQueue, laneIdleMs } from "./lanes.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
 import { textResult, imageResult, errorResult, evalResult } from "./response.js";
@@ -2190,7 +2190,18 @@ const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.me
 // Opt-in lanes (#76): one queue per process, shared by every per-session server, so two
 // transport sessions presenting the same laneId still serialize against each other.
 const _LANES = lanesEnabled(process.env);
-const _laneQueue = _LANES ? createLaneQueue() : null;
+const _laneQueue = _LANES
+  ? createLaneQueue({
+      idleMs: laneIdleMs(process.env),
+      // Everything the server keys by session id for this lane: tab state and the receipt.
+      onRelease: (key) => {
+        safari._dropSession(key);
+        _activeReceipts.delete(`${SESSION_ID}:${key}`);
+        console.error(`[Safari MCP] released idle ${key}`);
+      },
+    })
+  : null;
+_laneQueue?.startSweeper();
 function buildServer() {
 const server = new McpServer({
   name: "safari-mcp",
