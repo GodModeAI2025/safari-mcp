@@ -117,12 +117,27 @@ export function isMainModule(moduleUrl, argv1) {
   }
 }
 
+// Bounds for HTTP mode, where every MCP session gets its own full safari-mcp children and a
+// client that drops without DELETE would otherwise leak them forever.
+export const DEFAULT_ROUTER_MAX_SESSIONS = 16;
+export const DEFAULT_ROUTER_IDLE_MS = 30 * 60 * 1000;
+function positiveInt(raw, fallback) {
+  const n = Number(raw);
+  return raw !== undefined && raw !== "" && Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 export function createProfileRouter({
   env = process.env,
   childCommand = env.SAFARI_MCP_PROFILE_CHILD ? [process.execPath, env.SAFARI_MCP_PROFILE_CHILD] : [process.execPath, join(HERE, "index.js")],
+  maxSessions = positiveInt(env.SAFARI_MCP_ROUTER_MAX_SESSIONS, DEFAULT_ROUTER_MAX_SESSIONS),
+  // Idle expiry only makes sense when sessions come and go (HTTP). A stdio router IS its one
+  // session; expiring it would drop the user's tabs mid-task after a coffee break.
+  idleMs = env.SAFARI_MCP_HTTP && env.SAFARI_MCP_HTTP !== "0" ? positiveInt(env.SAFARI_MCP_ROUTER_IDLE_MS, DEFAULT_ROUTER_IDLE_MS) : 0,
+  now = Date.now,
 } = {}) {
   const plan = planProfiles(env);
   const sessions = new Map(); // router session id -> Map<profileKey, Promise<{client, transport}>>
+  const lastUsed = new Map(); // router session id -> last request time
   let toolsCache = null;
 
   function spawn(profileKey) {
@@ -137,8 +152,18 @@ export function createProfileRouter({
   }
 
   function childFor(sessionId, profileKey) {
+    lastUsed.set(sessionId, now());
     let children = sessions.get(sessionId);
-    if (!children) sessions.set(sessionId, (children = new Map()));
+    if (!children) {
+      if (maxSessions > 0 && sessions.size >= maxSessions) {
+        lastUsed.delete(sessionId);
+        throw new Error(
+          `Profile router is at its session limit (${maxSessions}); close another MCP session ` +
+          `or raise SAFARI_MCP_ROUTER_MAX_SESSIONS.`
+        );
+      }
+      sessions.set(sessionId, (children = new Map()));
+    }
     if (!children.has(profileKey)) {
       const p = spawn(profileKey).then((child) => {
         // A child that dies AFTER connecting (crash, killed, Safari relaunch) must be replaced,
@@ -167,6 +192,7 @@ export function createProfileRouter({
   }
 
   async function closeSession(sessionId) {
+    lastUsed.delete(sessionId);
     const children = sessions.get(sessionId);
     if (!children) return;
     sessions.delete(sessionId);
@@ -190,7 +216,13 @@ export function createProfileRouter({
       } catch (e) {
         return { content: [{ type: "text", text: e.message }], isError: true };
       }
-      const { client } = await childFor(currentSessionId(), key);
+      let child;
+      try {
+        child = await childFor(currentSessionId(), key);
+      } catch (e) {
+        return { content: [{ type: "text", text: e.message }], isError: true };
+      }
+      const { client } = child;
       return client.callTool({ name: req.params.name, arguments: args }, undefined, {
         timeout: forwardTimeoutMs(args),
         signal: extra?.signal, // the caller cancelling cancels the forwarded call too
@@ -202,12 +234,31 @@ export function createProfileRouter({
     return server;
   }
 
+  // Close the children of sessions idle for idleMs. Returns the closed session ids.
+  async function sweepIdle() {
+    if (!(idleMs > 0)) return [];
+    const t = now();
+    const idle = [...lastUsed].filter(([, at]) => t - at >= idleMs).map(([id]) => id);
+    await Promise.all(idle.map(closeSession));
+    return idle;
+  }
+  let sweeper = null;
+  if (idleMs > 0) {
+    sweeper = setInterval(() => { void sweepIdle(); }, Math.min(Math.max(idleMs / 4, 1000), 60_000));
+    sweeper.unref?.();
+  }
+
   return {
     plan,
     buildServer,
     closeSession,
+    sweepIdle,
+    stop() { if (sweeper) clearInterval(sweeper); },
     get sessionCount() { return sessions.size; },
-    async closeAll() { await Promise.all([...sessions.keys()].map(closeSession)); },
+    async closeAll() {
+      if (sweeper) clearInterval(sweeper);
+      await Promise.all([...sessions.keys()].map(closeSession));
+    },
   };
 }
 

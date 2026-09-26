@@ -53,8 +53,8 @@ test("child env: router-only and daemon settings never reach a child", () => {
   assert.ok(!("SAFARI_PROFILE" in childEnv(base, "")), "the default child runs on ordinary windows");
 });
 
-async function routerOverHttp(env) {
-  const router = createProfileRouter({ env: { ...process.env, ...env }, childCommand: [process.execPath, STUB] });
+async function routerOverHttp(env, opts = {}) {
+  const router = createProfileRouter({ env: { ...process.env, ...env }, childCommand: [process.execPath, STUB], ...opts });
   const handle = await startTransport(router.buildServer, { SAFARI_MCP_HTTP: "1", SAFARI_MCP_HTTP_PORT: "0" }, {
     dropSession: (id) => { void router.closeSession(id); },
   });
@@ -197,4 +197,47 @@ test("forwarded calls outlive the SDK's 60s default and the child's own budget",
   const src = readFileSync(ROUTER, "utf8");
   assert.match(src, /client\.callTool\(\{ name: req\.params\.name, arguments: args \}, undefined, \{\n\s*timeout: forwardTimeoutMs\(args\),/);
   assert.match(src, /signal: extra\?\.signal/);
+});
+
+test("HTTP router: sessions beyond the cap are refused instead of spawning more children", { timeout: 60_000 }, async () => {
+  const { router, handle, connect } = await routerOverHttp({ SAFARI_MCP_PROFILES: "Work", SAFARI_MCP_DEFAULT_PROFILE: "Work" }, { maxSessions: 1 });
+  const a = await connect();
+  const b = await connect();
+  try {
+    assert.equal((await who(a.client)).profile, "Work");
+    const refused = await who(b.client);
+    assert.match(refused.error, /session limit \(1\)/);
+    assert.equal(router.sessionCount, 1, "no child was spawned for the refused session");
+  } finally {
+    await a.client.close();
+    await b.client.close();
+    await router.closeAll();
+    await handle.close();
+  }
+});
+
+test("HTTP router: idle sessions release their children; stdio routers never expire", { timeout: 60_000 }, async () => {
+  let t = 0;
+  const { router, handle, connect } = await routerOverHttp(
+    { SAFARI_MCP_PROFILES: "Work", SAFARI_MCP_DEFAULT_PROFILE: "Work" },
+    { idleMs: 1000, now: () => t }
+  );
+  const { client } = await connect();
+  try {
+    const first = await who(client);
+    t = 500;
+    assert.deepEqual(await router.sweepIdle(), [], "not idle yet");
+    t = 5000;
+    assert.equal((await router.sweepIdle()).length, 1);
+    assert.equal(router.sessionCount, 0);
+    const again = await who(client);
+    assert.notEqual(again.pid, first.pid, "the next call gets a fresh child");
+  } finally {
+    await client.close();
+    await router.closeAll();
+    await handle.close();
+  }
+  const stdio = createProfileRouter({ env: { SAFARI_MCP_PROFILES: "Work" }, childCommand: [process.execPath, STUB] });
+  assert.deepEqual(await stdio.sweepIdle(), [], "idle expiry is off without SAFARI_MCP_HTTP");
+  stdio.stop();
 });

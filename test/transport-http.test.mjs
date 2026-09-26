@@ -89,3 +89,34 @@ test("http mode: an unknown session id returns 404 (client re-inits) — not 400
     await handle.close();
   }
 });
+
+test("http mode: DNS-rebinding guard — a foreign Host or Origin is refused before any MCP handling", async () => {
+  const { isAllowedLocalRequest } = await import("../transport.js");
+  assert.equal(isAllowedLocalRequest({ host: "127.0.0.1:9225" }, 9225), true);
+  assert.equal(isAllowedLocalRequest({ host: "localhost:9225" }, 9225), true);
+  assert.equal(isAllowedLocalRequest({ host: "[::1]:9225" }, 9225), true);
+  assert.equal(isAllowedLocalRequest({ host: "evil.example:9225" }, 9225), false, "rebound hostname");
+  assert.equal(isAllowedLocalRequest({ host: "127.0.0.1:80" }, 9225), false, "wrong port");
+  assert.equal(isAllowedLocalRequest({ host: "127.0.0.1" }, 9225), false, "no port");
+  assert.equal(isAllowedLocalRequest({}, 9225), false);
+  assert.equal(isAllowedLocalRequest({ host: "127.0.0.1:9225", origin: "http://evil.example" }, 9225), false);
+  assert.equal(isAllowedLocalRequest({ host: "127.0.0.1:9225", origin: "http://127.0.0.1:9225" }, 9225), true);
+  assert.equal(isAllowedLocalRequest({ host: "127.0.0.1:9225", origin: "null" }, 9225), false);
+
+  const handle = await startTransport(makeStubServer, { SAFARI_MCP_HTTP: "1", SAFARI_MCP_HTTP_PORT: "0" });
+  try {
+    const { request } = await import("node:http");
+    const status = (headers) => new Promise((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: handle.port, path: "/mcp", method: "POST", headers: {
+        "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers,
+      } }, (res) => { res.resume(); resolve(res.statusCode); });
+      req.on("error", reject);
+      req.end(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "x", version: "0" } } }));
+    });
+    assert.equal(await status({ Host: `rebind.example:${handle.port}` }), 403);
+    assert.equal(await status({ Origin: "http://evil.example" }), 403);
+    assert.equal(await status({}), 200, "a normal loopback client still initializes");
+  } finally {
+    await handle.close();
+  }
+});

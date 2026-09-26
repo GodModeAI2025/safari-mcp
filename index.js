@@ -2199,6 +2199,8 @@ const _laneQueue = _LANES
         _activeReceipts.delete(`${SESSION_ID}:${key}`);
         console.error(`[Safari MCP] released idle ${key}`);
       },
+      // The lane is back after its release: fail closed, never "fresh session on the front tab".
+      onRevive: (key) => safari._markSessionOrphaned(key),
     })
   : null;
 _laneQueue?.startSweeper();
@@ -2466,7 +2468,7 @@ server.tool(
     x: z.coerce.number().optional().describe("Viewport X coordinate"),
     y: z.coerce.number().optional().describe("Viewport Y coordinate"),
     doubleClick: z.boolean().optional().default(false).describe("Double-click instead of single click"),
-    activate: z.enum(["auto", "mouse", "keyboard"]).optional().default("auto").describe("auto (default): mouse click, and if the page saw no trusted mouse event (macOS 26 filters them) focus the element and press Space/Return natively. mouse: mouse only. keyboard: skip the mouse, focus + native key (needs ref/selector/text)."),
+    activate: z.enum(["auto", "mouse", "keyboard"]).optional().default("auto").describe("auto (default): mouse click; on macOS 26+, if the page saw no trusted mouse event and no toggle changed, focus the element and press Space/Return natively. mouse: mouse only. keyboard: skip the mouse, focus + native key (needs ref/selector/text)."),
   },
   async (args) => {
     // Native click always uses AppleScript path (no extension) — it needs OS-level access.

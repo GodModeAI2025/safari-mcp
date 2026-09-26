@@ -5,7 +5,7 @@
 
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
-import { tmpdir, homedir } from "node:os";
+import { tmpdir, homedir, release as osRelease } from "node:os";
 import { join, dirname, resolve as resolvePath } from "node:path";
 import { readFile, writeFile, unlink, appendFile, mkdir } from "node:fs/promises";
 import { readFileSync, realpathSync } from "node:fs";
@@ -296,6 +296,14 @@ function _st() {
   return s;
 }
 export function _dropSession(sid) { _sessions.delete(sid); } // called on MCP session close
+// A released lane that comes back must not look like a session that never owned a tab — that
+// state acts on the user's front tab. It returns as "owned a tab, lost it", so every op fails
+// closed until safari_new_tab claims a fresh one.
+export function _markSessionOrphaned(sid) {
+  _sessions.set(sid, { activeTabIndex: null, activeTabURL: null, hasOwnedTab: true,
+    lastResolveTime: 0, lastTabCount: null, activeTabMarker: null,
+    markerId: randomUUID().slice(0, 8) });
+}
 const RESOLVE_CACHE_MS = 100; // Brief cache — was 500, reduced to catch tabs added by user/popups (v2.8.3 fix)
 
 // ========== DIAGNOSTIC LOG ==========
@@ -1325,9 +1333,14 @@ let _tabFrontedDepth = 0;
 //   - a session that cannot read the selection, or whose fronted tab does not carry its
 //     marker, must refuse too — firing blind is the guess the ownership guard exists to stop.
 // A session that never owned a tab keeps the historical behaviour: act on the front tab.
-export function _nativeFrontingPlan({ ownsTab, hadMarker, markerAfter, resolvedIdx }) {
+//   - a session that owns a tab needs a LIVE marker for every native event. Every path that
+//     claims a tab stamps one, so "owns a tab, holds no marker" only means it was lost —
+//     cleared by the page (window.name=''), by a cross-site navigation, or by an earlier
+//     resolve. The URL/domain fallback in resolveActiveTab can then match a USER tab on the
+//     same site, and an OS-level event there is exactly #64. Refuse, whenever it was lost.
+export function _nativeFrontingPlan({ ownsTab, markerAfter, resolvedIdx }) {
   if (!ownsTab) return resolvedIdx ? { action: "front", idx: resolvedIdx } : { action: "unfronted" };
-  if (hadMarker && !markerAfter) return { action: "refuse" }; // marker proven gone
+  if (!markerAfter) return { action: "refuse" }; // no live marker: identity cannot be proven
   if (!resolvedIdx) return { action: "refuse" };
   return { action: "front", idx: resolvedIdx };
 }
@@ -1345,7 +1358,6 @@ async function _withTargetTabFronted(fn) {
 
   const s = _st();
   const ownsTab = !!(s.hasOwnedTab || s.activeTabMarker);
-  const hadMarker = !!s.activeTabMarker;
   let resolvedIdx = s.activeTabIndex;
   if (ownsTab) {
     try {
@@ -1354,7 +1366,7 @@ async function _withTargetTabFronted(fn) {
       resolvedIdx = null;
     }
   }
-  const plan = _nativeFrontingPlan({ ownsTab, hadMarker, markerAfter: !!_st().activeTabMarker, resolvedIdx });
+  const plan = _nativeFrontingPlan({ ownsTab, markerAfter: !!_st().activeTabMarker, resolvedIdx });
   if (plan.action === "refuse") throw _nativeTrackingLostError("this session's tab could not be re-identified by its marker");
   if (plan.action === "unfronted") return await fn(); // never owned a tab — nothing to front
   const idx = plan.idx;
@@ -1386,6 +1398,12 @@ async function _withTargetTabFronted(fn) {
   // Prove the SELECTED tab is ours right before the event fires. resolveActiveTab may have
   // settled on a URL/domain match, and a tab can move between the resolve and the switch.
   const marker = _st().activeTabMarker;
+  if (ownsTab && !marker) {
+    if (mustSwitch) {
+      await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${prev}`).catch(() => {});
+    }
+    throw _nativeTrackingLostError("this session's tab marker was lost");
+  }
   if (marker) {
     const safeMarker = marker.replace(/'/g, "\\'");
     const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
@@ -2312,7 +2330,10 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
   }
   // Trusted-delivery probe (#29): armed in the same script that locates the element, so it is
   // in place before the event is posted. Only for element targets and single clicks.
-  const probe = byElement && !doubleClick && activate !== "mouse" ? `mcpnc${randomUUID().slice(0, 12)}` : null;
+  // `auto` only probes where the OS may drop mouse events (macOS 26+). Elsewhere a delivered
+  // click is the norm, and a probe a hostile page can blind would only risk a second press.
+  const wantsProbe = activate === "keyboard" || (activate === "auto" && _autoKeyboardFallbackApplies(_darwinMajor()));
+  const probe = byElement && !doubleClick && wantsProbe ? `mcpnc${randomUUID().replace(/-/g, "").slice(0, 16)}` : null;
 
   // Step 1: Get element's viewport coordinates via JavaScript
   let viewportCoords;
@@ -2430,20 +2451,40 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
 const NATIVE_CLICK_PROBE_MS = 200;
 
 // Page-side probe. Any trusted pointerdown/mousedown/click after arming proves the OS event
-// reached WebKit. Listeners are window-level capture, so they run before page handlers can
-// stop propagation. The element gets a data attribute so the fallback can find it again.
+// reached WebKit; so does a toggle whose checked/aria state changed. Hardened after review:
+//   - state lives under a per-click random key, not a fixed global a page could pre-set to
+//     blind the probe (the old `__mcpNCL` guard skipped installing the listeners entirely);
+//   - listeners are installed on EVERY arm and removed on read/clear, on the element's own
+//     window too, so a click inside a same-origin iframe is seen;
+//   - the element is held by reference, so the fallback finds it in an iframe as well.
+// A page can still swallow the events with an earlier capture listener; the toggle check and
+// the macOS 26 gate keep that from turning into a second press on the common cases.
+const _PROBE_TOGGLE_JS = "function(e){return [e.checked,e.getAttribute('aria-checked'),e.getAttribute('aria-pressed'),e.getAttribute('aria-expanded'),e.getAttribute('aria-selected')].join('|');}";
 function _nativeClickProbeArmJS(token) {
-  return `el.setAttribute('data-mcp-nc','${token}');` +
-    `window.__mcpNC={t:'${token}',trusted:false};` +
-    `if(!window.__mcpNCL){window.__mcpNCL=1;['pointerdown','mousedown','click'].forEach(function(n){` +
-    `window.addEventListener(n,function(e){if(e.isTrusted&&window.__mcpNC)window.__mcpNC.trusted=true;},true);});}`;
+  return `(function(){var tog=${_PROBE_TOGGLE_JS};` +
+    `var w=(el.ownerDocument&&el.ownerDocument.defaultView)||window;` +
+    `var st={el:el,trusted:false,tog:tog(el)};` +
+    `var h=function(e){if(e.isTrusted)st.trusted=true;};` +
+    `var ws=w===window?[window]:[w,window];var names=['pointerdown','mousedown','click'];` +
+    `ws.forEach(function(x){names.forEach(function(n){x.addEventListener(n,h,true);});});` +
+    `st.off=function(){ws.forEach(function(x){names.forEach(function(n){x.removeEventListener(n,h,true);});});};` +
+    `st.changed=function(){return tog(st.el)!==st.tog;};` +
+    `Object.defineProperty(window,'${token}',{value:st,configurable:true,enumerable:false});})();`;
 }
 function _nativeClickProbeReadJS(token) {
-  return `(function(){var p=window.__mcpNC;if(!p||p.t!=='${token}')return 'gone';return p.trusted?'1':'0';})()`;
+  return `(function(){var st=window['${token}'];if(!st||!st.el||!st.el.isConnected)return 'gone';` +
+    `return (st.trusted||st.changed())?'1':'0';})()`;
 }
 function _nativeClickProbeClearJS(token) {
-  return `(function(){var e=document.querySelector('[data-mcp-nc="${token}"]');if(e)e.removeAttribute('data-mcp-nc');` +
-    `if(window.__mcpNC&&window.__mcpNC.t==='${token}')window.__mcpNC=null;return 'ok';})()`;
+  return `(function(){var st=window['${token}'];if(st){st.off();delete window['${token}'];}return 'ok';})()`;
+}
+
+// Darwin 25 is macOS 26 (Tahoe), where mouse CGEvents can be accepted and never delivered.
+function _darwinMajor() {
+  return process.platform === "darwin" ? Number(String(osRelease()).split(".")[0]) || 0 : 0;
+}
+export function _autoKeyboardFallbackApplies(darwinMajor) {
+  return Number(darwinMajor) >= 25;
 }
 
 // '0' is the only verdict that triggers the fallback. 'gone' (the page navigated or the probe
@@ -2465,16 +2506,7 @@ export function _activationKeyFor({ tag, role, type }) {
 }
 
 async function _activateViaKeyboard(token, windowId) {
-  const raw = await runJS(`(function(){
-    var el=document.querySelector('[data-mcp-nc="${token}"]');
-    if(!el) return JSON.stringify({error:'element no longer on the page'});
-    if(!el.hasAttribute('tabindex') && el.tabIndex < 0) el.setAttribute('tabindex','-1');
-    el.focus({preventScroll:true});
-    var info={focused:document.activeElement===el,tag:el.tagName,role:el.getAttribute('role')||'',type:el.getAttribute('type')||''};
-    el.removeAttribute('data-mcp-nc');
-    if(window.__mcpNC&&window.__mcpNC.t==='${token}')window.__mcpNC=null;
-    return JSON.stringify(info);
-  })()`);
+  const raw = await runJS(_activateViaKeyboardJS(token));
   let info;
   try { info = JSON.parse(raw); } catch { throw new Error("native_click keyboard activation: unreadable page reply: " + raw); }
   if (info.error) throw new Error(`native_click keyboard activation failed: ${info.error}`);
@@ -2482,6 +2514,17 @@ async function _activateViaKeyboard(token, windowId) {
   const key = _activationKeyFor(info);
   await _helperNativeKeyboard(macKeyCodeMap[key], [], windowId);
   return key === "space" ? "Space" : "Return";
+}
+
+// Focus the probed element (held by reference — works inside same-origin iframes) and report
+// what it is. activeElement is checked in the element's OWN document.
+function _activateViaKeyboardJS(token) {
+  return `(function(){var st=window['${token}'];` +
+    `if(!st||!st.el||!st.el.isConnected)return JSON.stringify({error:'element no longer on the page'});` +
+    `var el=st.el;st.off();delete window['${token}'];` +
+    `if(!el.hasAttribute('tabindex')&&el.tabIndex<0)el.setAttribute('tabindex','-1');` +
+    `el.focus({preventScroll:true});` +
+    `return JSON.stringify({focused:el.ownerDocument.activeElement===el,tag:el.tagName,role:el.getAttribute('role')||'',type:el.getAttribute('type')||''});})()`;
 }
 
 // ========== NATIVE HOVER (OS-level CGEvent mouse move — triggers real :hover and mouseenter) ==========

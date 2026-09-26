@@ -67,10 +67,16 @@ export function laneIdleMs(env = {}) {
 // It also remembers when each lane was last active, so lanes that stop calling can have their
 // server-side state released by sweep(). Lane ids are chosen by clients, so without this every
 // id ever seen would pin a state entry for the life of the process. A lane is only released
-// when nothing of it is queued or running, and only after `idleMs` of silence; a later call
-// with the same laneId simply starts fresh.
-export function createLaneQueue({ idleMs = 0, onRelease = () => {}, now = Date.now } = {}) {
+// when nothing of it is queued or running, and only after `idleMs` of silence.
+//
+// A released lane that calls again must not come back as a lane that never owned a tab: that
+// state acts on the user's front tab. Released keys are remembered (bounded) and `onRevive`
+// fires before the lane's next call, so the host can restore it as "owned a tab, lost it" —
+// every op then fails closed until safari_new_tab.
+export const RELEASED_LANES_CAP = 10000;
+export function createLaneQueue({ idleMs = 0, onRelease = () => {}, onRevive = () => {}, now = Date.now } = {}) {
   const tails = new Map();
+  const tombstones = new Set(); // released lane keys; insertion-ordered, oldest evicted first
   const lastActive = new Map();
   const running = new Map();
   const bump = (key, d) => {
@@ -80,6 +86,9 @@ export function createLaneQueue({ idleMs = 0, onRelease = () => {}, now = Date.n
   };
   const queue = {
     run(key, fn) {
+      if (tombstones.delete(key)) {
+        try { onRevive(key); } catch { /* reviving is best-effort; the op guards still apply */ }
+      }
       lastActive.set(key, now());
       bump(key, 1);
       const prev = tails.get(key) || Promise.resolve();
@@ -106,6 +115,8 @@ export function createLaneQueue({ idleMs = 0, onRelease = () => {}, now = Date.n
         if (running.has(key) || t - at < idleMs) continue;
         lastActive.delete(key);
         try { onRelease(key); } catch { /* releasing is best-effort */ }
+        tombstones.add(key);
+        if (tombstones.size > RELEASED_LANES_CAP) tombstones.delete(tombstones.values().next().value);
         released.push(key);
       }
       return released;

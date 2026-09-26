@@ -328,6 +328,8 @@ Then point every client at it:
 { "mcpServers": { "safari-mcp": { "type": "http", "url": "http://127.0.0.1:9225/mcp" } } }
 ```
 
+The daemon only answers requests whose `Host` (and `Origin`, if sent) is `127.0.0.1`, `localhost` or `[::1]` on its own port, so a web page cannot reach it through DNS rebinding.
+
 One daemon, many sessions — and each session gets its **own tab state**. The server keys `activeTabIndex`, the ownership flag and a unique tab marker off the MCP session id, so session A physically cannot read or steer session B's tab.
 
 Two properties make this safe rather than merely tidy:
@@ -359,7 +361,7 @@ mcporter call safari.safari_snapshot laneId="$PI_SESSION_ID"
 - **Re-claim:** state is keyed by the lane, not the connection. Reconnect with the same `laneId` and you're back on your tab; another lane never inherits it.
 - **Serialized:** calls into the same lane run one at a time, in order. Different lanes still run concurrently.
 - **Fails closed:** a call without a valid `laneId` (`[A-Za-z0-9._:-]`, max 128) is rejected. There is no default lane to fall into.
-- **Idle lanes are released:** a lane that makes no calls for `SAFARI_MCP_LANE_IDLE_MS` (default 1 hour, `0` = never) has its server-side state dropped, so arbitrary lane ids cannot grow the process forever. A lane with a call in flight is never released. Its tab stays open, and the next call with that `laneId` starts fresh.
+- **Idle lanes are released:** a lane that makes no calls for `SAFARI_MCP_LANE_IDLE_MS` (default 1 hour, `0` = never) has its server-side state dropped, so arbitrary lane ids cannot grow the process forever. A lane with a call in flight is never released. Its tab stays open. The next call with that `laneId` fails closed (the lane has lost its tab), so call `safari_new_tab` to continue. It never falls back to the tab in front.
 
 Works over stdio and HTTP. Off by default, so tool schemas don't change unless you opt in. `test/session-cardinality.test.mjs` asserts these invariants in CI, and also checks that a client-caching runner shows up as a single collapsed session there, not in production.
 
@@ -394,6 +396,7 @@ safari_navigate { "url": "https://example.com" }        ← your ordinary window
 - **Unknown names are refused,** never served by another profile's windows.
 - **Per session:** in HTTP mode (`SAFARI_MCP_HTTP=1`) each MCP session gets its own children, which are shut down when the session ends, so two agents never share a child.
 - The argument is `safariProfile`, not `profile`, because `safari_throttle_network` already has a `profile` parameter.
+- **Bounded:** in HTTP mode the router serves at most `SAFARI_MCP_ROUTER_MAX_SESSIONS` sessions at once (default 16). A session idle for `SAFARI_MCP_ROUTER_IDLE_MS` (default 30 min) has its children shut down, and a later call starts fresh ones.
 
 ---
 
