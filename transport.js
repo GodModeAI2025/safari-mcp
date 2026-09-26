@@ -36,6 +36,11 @@ export function planTransport(env = {}) {
 // prove: onSessionInitialized(id) when a client is issued an Mcp-Session-Id, onRequest(id) for
 // every request routed to a live session, onSessionClosed(id) when one ends. Purely
 // observational; a throwing observer is swallowed so it can never break routing.
+/**
+ * @param {() => any} createMcpServer
+ * @param {Record<string, string | undefined>} [env]
+ * @param {{ observer?: { onSessionInitialized?: (id: string) => void, onRequest?: (id: string) => void, onSessionClosed?: (id: string) => void } }} [opts]
+ */
 export async function startTransport(createMcpServer, env = process.env, { observer } = {}) {
   const notify = (hook, id) => {
     try { observer?.[hook]?.(id); } catch { /* observability must never break routing */ }
@@ -124,7 +129,7 @@ export async function startTransport(createMcpServer, env = process.env, { obser
   return {
     kind: "http",
     // The bound port, not the requested one — SAFARI_MCP_HTTP_PORT=0 picks a free port.
-    port: httpServer.address().port,
+    port: /** @type {import("node:net").AddressInfo} */ (httpServer.address()).port,
     async close() {
       for (const t of transports.values()) await t.close().catch(() => {});
       await new Promise((r) => httpServer.close(r));
