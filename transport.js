@@ -63,6 +63,11 @@ export async function startTransport(createMcpServer, env = process.env, { obser
 
   const httpServer = createServer(async (req, res) => {
     try {
+      if (!isAllowedLocalRequest(req.headers, httpServer.address().port)) {
+        res.statusCode = 403;
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden host or origin" }, id: null }));
+        return;
+      }
       let body;
       if (req.method === "POST") {
         const chunks = [];
@@ -147,4 +152,22 @@ function isInitialize(body) {
 
 function _defaultDropSession(id) {
   import("./safari.js").then((m) => m._dropSession(id)).catch(() => {});
+}
+
+// DNS-rebinding guard. Binding to 127.0.0.1 is not enough: a web page whose hostname
+// re-resolves to 127.0.0.1 can talk to this port "same-origin" and drive Safari with the
+// user's logins. MCP clients are not browsers — they send Host 127.0.0.1/localhost and no
+// Origin. So: the Host must name loopback on OUR port, and an Origin, if present, must too.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+export function isAllowedLocalRequest(headers = {}, port) {
+  const host = String(headers.host || "").toLowerCase();
+  if (!LOOPBACK_HOSTS.has(host.replace(/:\d+$/, "")) || host !== `${host.replace(/:\d+$/, "")}:${port}`) return false;
+  const origin = headers.origin;
+  if (origin === undefined) return true;
+  try {
+    const u = new URL(String(origin));
+    return (u.protocol === "http:" || u.protocol === "https:") && LOOPBACK_HOSTS.has(u.hostname.toLowerCase()) && String(u.port) === String(port);
+  } catch {
+    return false;
+  }
 }

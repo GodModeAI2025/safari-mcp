@@ -66,6 +66,7 @@ test("index.js only applies lanes behind the flag, with one queue shared by ever
   assert.match(src, /safari\._dropSession\(key\);/, "a released lane must drop its tab state");
   assert.match(src, /_activeReceipts\.delete\(`\$\{SESSION_ID\}:\$\{key\}`\);/, "and its active receipt");
   assert.match(src, /_laneQueue\?\.startSweeper\(\);/);
+  assert.match(src, /onRevive: \(key\) => safari\._markSessionOrphaned\(key\)/, "a revived lane must fail closed");
   const build = src.slice(src.indexOf("function buildServer()"), src.indexOf("// ========== NAVIGATION =========="));
   assert.match(build, /if \(_LANES\) applyLanes\(server, \{ queue: _laneQueue \}\);/);
 });
@@ -120,4 +121,31 @@ test("a throwing release hook does not stop the sweep", async () => {
   await q.run("lane:b", async () => {});
   t = 100;
   assert.deepEqual(q.sweep().sort(), ["lane:a", "lane:b"]);
+});
+
+test("a released lane that calls again is revived before its call runs (fail-closed hook)", async () => {
+  let t = 0;
+  const events = [];
+  const q = createLaneQueue({
+    idleMs: 10, now: () => t,
+    onRelease: (k) => events.push(`release ${k}`),
+    onRevive: (k) => events.push(`revive ${k}`),
+  });
+  await q.run("lane:a", async () => events.push("call 1"));
+  t = 100;
+  q.sweep();
+  await q.run("lane:a", async () => events.push("call 2"));
+  await q.run("lane:a", async () => events.push("call 3"));
+  assert.deepEqual(events, ["call 1", "release lane:a", "revive lane:a", "call 2", "call 3"],
+    "revive fires once, before the first call after release");
+  await q.run("lane:never", async () => events.push("fresh"));
+  assert.ok(!events.includes("revive lane:never"), "a lane that was never released is not revived");
+});
+
+test("_markSessionOrphaned restores a lane as 'owned a tab, lost it'", async () => {
+  const src = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
+  const fn = src.slice(src.indexOf("export function _markSessionOrphaned("), src.indexOf("const RESOLVE_CACHE_MS"));
+  assert.match(fn, /hasOwnedTab: true/);
+  assert.match(fn, /activeTabIndex: null/);
+  assert.match(fn, /activeTabMarker: null/);
 });

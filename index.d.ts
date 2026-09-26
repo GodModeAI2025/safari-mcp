@@ -348,7 +348,7 @@ export interface SafariToolInputs {
     y?: number;
     /** Double-click instead of single click */
     doubleClick?: boolean;
-    /** auto (default): mouse click, and if the page saw no trusted mouse event (macOS 26 filters them) focus the element and press Space/Return natively. mouse: mouse only. keyboard: skip the mouse, focus + native key (needs ref/selector/text). */
+    /** auto (default): mouse click; on macOS 26+, if the page saw no trusted mouse event and no toggle changed, focus the element and press Space/Return natively. mouse: mouse only. keyboard: skip the mouse, focus + native key (needs ref/selector/text). */
     activate?: "auto" | "mouse" | "keyboard";
   };
   /** OS-level mouse hover via macOS CGEvent — moves the real cursor to an element to trigger native :hover / mouseenter handlers. Use for obfuscated UIs where JS-dispatched mouseenter isn't enough, like Discord server sidebars (tooltips only appear on real hover) or portal-rendered tooltips. After hover, call safari_wait_for or safari_evaluate to read the tooltip. Dwells for dwellMs to let tooltips render, then restores the original cursor position by default. Requires Safari window to be visible. */

@@ -26,32 +26,32 @@ const gate = src.slice(
 
 test("a session that owns a tab but lost its index refuses instead of firing unfronted", () => {
   assert.deepEqual(
-    _nativeFrontingPlan({ ownsTab: true, hadMarker: true, markerAfter: true, resolvedIdx: null }),
+    _nativeFrontingPlan({ ownsTab: true, markerAfter: true, resolvedIdx: null }),
     { action: "refuse" }
   );
   assert.deepEqual(
-    _nativeFrontingPlan({ ownsTab: true, hadMarker: false, markerAfter: false, resolvedIdx: null }),
+    _nativeFrontingPlan({ ownsTab: true, markerAfter: false, resolvedIdx: null }),
     { action: "refuse" }
   );
 });
 
 test("a marker proven gone refuses even if a URL/domain match produced an index", () => {
   assert.deepEqual(
-    _nativeFrontingPlan({ ownsTab: true, hadMarker: true, markerAfter: false, resolvedIdx: 4 }),
+    _nativeFrontingPlan({ ownsTab: true, markerAfter: false, resolvedIdx: 4 }),
     { action: "refuse" }
   );
 });
 
 test("a re-proven tab is fronted at its CURRENT index, not the cached one", () => {
   assert.deepEqual(
-    _nativeFrontingPlan({ ownsTab: true, hadMarker: true, markerAfter: true, resolvedIdx: 5 }),
+    _nativeFrontingPlan({ ownsTab: true, markerAfter: true, resolvedIdx: 5 }),
     { action: "front", idx: 5 }
   );
 });
 
 test("a session that never owned a tab keeps the historical front-tab behaviour", () => {
   assert.deepEqual(
-    _nativeFrontingPlan({ ownsTab: false, hadMarker: false, markerAfter: false, resolvedIdx: null }),
+    _nativeFrontingPlan({ ownsTab: false, markerAfter: false, resolvedIdx: null }),
     { action: "unfronted" }
   );
 });
@@ -79,4 +79,20 @@ test("the selected tab's marker is verified after the switch and before the even
   const refuse = gate.slice(verifyAt, fireAt);
   assert.match(refuse, /set current tab to tab \$\{prev\}/, "a refused switch must hand the user's tab back");
   assert.match(refuse, /throw _nativeTrackingLostError\(/);
+});
+
+test("a marker lost BEFORE this call (page cleared window.name) still refuses a URL/domain match", () => {
+  // Security review: the refusal used to fire only when the marker vanished inside this very
+  // call. Once lost earlier, resolveActiveTab matched by URL/domain — possibly a user tab on
+  // the same site — and the event fired there.
+  assert.deepEqual(
+    _nativeFrontingPlan({ ownsTab: true, markerAfter: false, resolvedIdx: 4 }),
+    { action: "refuse" }
+  );
+});
+
+test("after the switch, an owned session with no marker refuses and hands the tab back", () => {
+  const branch = gate.slice(gate.indexOf("if (ownsTab && !marker) {"), gate.indexOf("if (marker) {"));
+  assert.match(branch, /set current tab to tab \$\{prev\}/);
+  assert.match(branch, /throw _nativeTrackingLostError\(/);
 });
