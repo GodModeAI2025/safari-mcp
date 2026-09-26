@@ -365,6 +365,38 @@ Works over stdio and HTTP. Off by default, so tool schemas don't change unless y
 
 ---
 
+## Choosing the Safari profile per call
+
+`SAFARI_PROFILE` binds a whole server to one profile. To pick the profile per call from one MCP entry, run the profile router instead:
+
+```json
+{
+  "mcpServers": {
+    "safari-mcp": {
+      "command": "npx",
+      "args": ["-y", "-p", "safari-mcp", "safari-mcp-profiles"],
+      "env": { "SAFARI_MCP_PROFILES": "Work,Personal" }
+    }
+  }
+}
+```
+
+Every tool then takes an optional `safariProfile` (one of the configured names):
+
+```
+safari_new_tab  { "url": "https://mail.example.com", "safariProfile": "Work" }
+safari_snapshot { "safariProfile": "Work" }
+safari_navigate { "url": "https://example.com" }        ← your ordinary windows
+```
+
+- **One child per profile.** The router starts an ordinary safari-mcp with `SAFARI_PROFILE=<name>` for each profile the first time you use it, so every profile guarantee stays as it is (extension-only routing, verified worker, own tabs and receipts).
+- **Default:** calls without `safariProfile` go to `SAFARI_MCP_DEFAULT_PROFILE`, or to your ordinary windows when that is unset.
+- **Unknown names are refused,** never served by another profile's windows.
+- **Per session:** in HTTP mode (`SAFARI_MCP_HTTP=1`) each MCP session gets its own children, which are shut down when the session ends, so two agents never share a child.
+- The argument is `safariProfile`, not `profile`, because `safari_throttle_network` already has a `profile` parameter.
+
+---
+
 ## Acting on a tab you already have open
 
 By default the server touches only tabs it opened itself. Point it at one of yours and it refuses:
@@ -397,6 +429,10 @@ What the flag deliberately does *not* do:
 | `SAFARI_MCP_HTTP` | off | Run one shared HTTP daemon instead of a process per client (see above). |
 | `SAFARI_MCP_HTTP_PORT` | `9225` | Port for that daemon. |
 | `SAFARI_PROFILE` | unset | Bind sessions to a named Safari profile. Unset = your ordinary windows. |
+| `SAFARI_MCP_PROFILES` | unset | Profile router only (`safari-mcp-profiles`): comma-separated profiles selectable per call via `safariProfile`. |
+| `SAFARI_MCP_DEFAULT_PROFILE` | unset | Profile router only: profile for calls without `safariProfile`. Unset = your ordinary windows. |
+| `SAFARI_MCP_LANES` | off | Require a `laneId` on every tool call and keep tab state per lane (see above). |
+| `SAFARI_MCP_LANE_IDLE_MS` | `3600000` | Release a lane's state after this much silence. `0` = never. |
 | `SAFARI_MCP_ALLOW_USER_TABS` | off | Let `safari_switch_tab` adopt a tab **you** already had open, instead of refusing it (see below). |
 | `SAFARI_MCP_RAISE_ON_NAVIGATE` | off | Let navigation bring Safari to the front, and stop the focus guard from putting your previous app back. |
 | `SAFARI_MCP_SCREENSHOT_MAX_WIDTH` | unset | Downscale every `safari_screenshot` to this pixel width (Retina captures are 2× the viewport). Per-call `maxWidth` overrides it. |

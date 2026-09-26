@@ -7,7 +7,8 @@
   "main": "index.js",
   "types": "index.d.ts",
   "bin": {
-    "safari-mcp": "index.js"
+    "safari-mcp": "index.js",
+    "safari-mcp-profiles": "profile-router.js"
   },
   "scripts": {
     "start": "node index.js",
@@ -67,6 +68,7 @@
     "index.js",
     "index.d.ts",
     "transport.js",
+    "profile-router.js",
     "response.js",
     "safari.js",
     "session-context.js",

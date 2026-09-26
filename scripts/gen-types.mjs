@@ -112,6 +112,9 @@ export type SafariToolInput<N extends SafariToolName> = SafariToolInputs[N];
 /** With SAFARI_MCP_LANES=1 every tool additionally requires a laneId. */
 export type SafariLaneToolInput<N extends SafariToolName> = SafariToolInputs[N] & { laneId: string };
 
+/** Through the profile router (safari-mcp-profiles) every tool also takes an optional safariProfile. */
+export type SafariProfileToolInput<N extends SafariToolName> = SafariToolInputs[N] & { safariProfile?: string };
+
 export declare const SAFARI_TOOL_COUNT: ${sorted.length};
 `;
 }
