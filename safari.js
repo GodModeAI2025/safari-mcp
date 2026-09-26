@@ -909,7 +909,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
         return stdout.trim();
       }
     }
-    throw new Error(`AppleScript error: ${err.stderr || err.message}`);
+    throw new Error(`AppleScript error: ${err.stderr || err.message}`, { cause: err });
   } finally {
     // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
@@ -1521,7 +1521,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
         if (_gs.length < 50000) return await osascriptFast(_gs, { timeout });
         return await osascript(_gs, { timeout });
       }
-      throw new Error('Tab tracking lost — marked tab not found (atomic guard fail-closed). Call safari_new_tab to reopen.');
+      throw new Error('Tab tracking lost — marked tab not found (atomic guard fail-closed). Call safari_new_tab to reopen.', { cause: err });
     }
     // Tab ghost recovery: "Can't get tab X" → re-resolve and retry once.
     // Match both apostrophes — Safari emits a typographic apostrophe (U+2019),
@@ -1553,7 +1553,8 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
         throw new Error(
           `Tab tracking lost during runJS — original tab ${idx} no longer exists, and URL-based resolution failed. ` +
           `Refusing to fall back to "current tab of window" (would target user's active tab). ` +
-          `Call safari_new_tab to open a fresh tab and retry.`
+          `Call safari_new_tab to open a fresh tab and retry.`,
+          { cause: err }
         );
       }
       // No owned tab in this session — front-document fallback is intentional.
@@ -3705,7 +3706,7 @@ async function _screenshotFronted({ fullPage }) {
         }
       } catch (e) {
         if (e && e.message === "SCREEN_LOCKED") {
-          throw new Error("screenshot unavailable — the screen is locked, so the capture would be solid black. Unlock the Mac and retry. (Text-based tools — safari_snapshot / safari_read_page / safari_evaluate — work regardless.)");
+          throw new Error("screenshot unavailable — the screen is locked, so the capture would be solid black. Unlock the Mac and retry. (Text-based tools — safari_snapshot / safari_read_page / safari_evaluate — work regardless.)", { cause: e });
         }
         // crop path failed too — fall through to the JS canvas method
       }
@@ -3905,7 +3906,7 @@ async function _screenshotElementFronted({ selector }) {
     } catch (e) {
       await unlink(tmpFile).catch(() => {});
       if (cropFile) await unlink(cropFile).catch(() => {});  // captured path — old code rebuilt it with the wrong timestamp and leaked it
-      throw new Error(`Element screenshot failed: ${e.message}`);
+      throw new Error(`Element screenshot failed: ${e.message}`, { cause: e });
     }
   }
 
@@ -4976,7 +4977,7 @@ export async function savePDF({ path: pdfPath }) {
     } catch (err) {
       // Restore bounds on failure
       await osascript(`tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`).catch(() => {});
-      throw new Error(`PDF screenshot capture failed: ${err.message}`);
+      throw new Error(`PDF screenshot capture failed: ${err.message}`, { cause: err });
     }
 
     // Step 4: Restore original bounds
@@ -4991,7 +4992,7 @@ export async function savePDF({ path: pdfPath }) {
   try {
     await execFileAsync("/usr/bin/sips", ["-s", "format", "pdf", tmpPng, "--out", pdfPath], { timeout: 15000 });
   } catch (err) {
-    throw new Error(`PDF conversion failed: ${err.message}`);
+    throw new Error(`PDF conversion failed: ${err.message}`, { cause: err });
   } finally {
     unlink(tmpPng).catch(() => {});
   }
@@ -5058,7 +5059,7 @@ export async function takeSnapshot({ selector, _gen } = {}) {
         }
         if (el.tagName === 'IMG') return el.alt || '';
         if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
-          var label = el.closest('label') || (el.id && document.querySelector('label[for=\"'+el.id+'\"]'));
+          var label = el.closest('label') || (el.id && document.querySelector('label[for="'+el.id+'"]'));
           if (label) return label.textContent.trim().substring(0,80);
           if (el.placeholder) return el.placeholder;
           if (el.name) return el.name;
@@ -5294,7 +5295,7 @@ export async function getAccessibilityTree({ selector, maxDepth = 5 }) {
 
 // ========== COOKIE CRUD ==========
 
-export async function setCookie({ name, value, domain, path: cookiePath, expires, secure, sameSite, httpOnly }) {
+export async function setCookie({ name, value, domain, path: cookiePath, expires, secure, sameSite, httpOnly: _httpOnly }) {
   const safeName = escJsSingleQuote(name);
   const safeValue = escJsSingleQuote(value);
   // Every interpolated attribute goes through escJsSingleQuote — path/domain/expires
@@ -5648,7 +5649,7 @@ export async function getPerformanceMetrics() {
 
 // ========== NETWORK THROTTLING ==========
 
-export async function throttleNetwork({ profile, latency, downloadKbps, uploadKbps }) {
+export async function throttleNetwork({ profile, latency, downloadKbps, uploadKbps: _uploadKbps }) {
   const profiles = {
     "slow-3g": { latency: 2000, download: 50, upload: 50 },
     "fast-3g": { latency: 560, download: 150, upload: 75 },
@@ -5964,7 +5965,7 @@ export async function doctor() {
   const add = (ok, label, detail, fix) => checks.push({ ok, label, detail, fix: ok ? null : fix });
 
   // 1. Safari running
-  let safariUp = false;
+  let safariUp;
   try {
     const { stdout } = await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
     safariUp = stdout.trim().length > 0;
@@ -5972,7 +5973,7 @@ export async function doctor() {
   add(safariUp, "Safari running", safariUp ? "Safari process is up" : "Safari is not running", "Open Safari, then retry.");
 
   // 2. Apple Events / Automation — the bridge every AppleScript tool uses
-  let aeOk = false, aeDetail = "";
+  let aeOk = false, aeDetail;
   try {
     const out = await osascript(`tell application "Safari" to return (count of windows) as string`, { timeout: 5000 });
     aeOk = /^\d+$/.test(String(out).trim());
@@ -6009,7 +6010,7 @@ export async function doctor() {
     `System Settings > Privacy & Security > Screen & System Audio Recording → enable ${process.ppid === 1 ? `node at ${process.execPath} (this server runs under launchd)` : "the terminal/IDE that launched this server"}.`);
 
   // 6. Helper codesign identity — a stale/ad-hoc id breaks the Accessibility grant on reinstall
-  let idOk = false, idDetail = "";
+  let idOk = false, idDetail;
   const helperPath = join(__dirname, "safari-helper");
   try {
     const res = await execFileAsync("codesign", ["-d", "--verbose=2", helperPath], { timeout: 4000 })

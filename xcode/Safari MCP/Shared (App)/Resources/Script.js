@@ -1,3 +1,4 @@
+// eslint-disable-next-line no-unused-vars -- called from ViewController.swift via evaluateJavaScript
 function show(platform, enabled, useSettingsInsteadOfPreferences) {
     document.body.classList.add(`platform-${platform}`);
 

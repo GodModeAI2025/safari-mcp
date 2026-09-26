@@ -73,7 +73,7 @@ function fakeNavigator() {
 
 test("the override survives hostile quotes and is removed by reset — and only it", () => {
   const navigator = fakeNavigator();
-  const hostile = `it's a \\"UA\\"   line`;
+  const hostile = `it's a \\"UA\\" \u2028 line`;
   const js = buildNavigatorOverrideJS({ ua: hostile, platform: "iPhone", touchPoints: 5 });
   assert.equal(vm.runInNewContext(js, { navigator }), hostile);
   assert.equal(navigator.platform, "iPhone");

@@ -6,13 +6,12 @@
 // Extension transport: HTTP polling (Safari — WebSocket blocked by Apple)
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { startTransport } from "./transport.js";
 import { currentSessionId } from "./session-context.js";
 import { lanesEnabled, applyLanes, createLaneQueue } from "./lanes.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
-import { textResult, jsonResult, imageResult, errorResult, evalResult } from "./response.js";
+import { textResult, imageResult, errorResult, evalResult } from "./response.js";
 import {
   OWNERSHIP_DIR, BLANK_TAB_SENTINEL,
   _openedTabs, _ownedTabURLs,
@@ -82,7 +81,7 @@ function _getBridgeToken() {
       const repaired = readFileSync(BRIDGE_TOKEN_FILE, "utf8").trim();
       if (/^[0-9a-f]{64}$/.test(repaired)) return repaired;
     } catch {}
-    throw new Error(`Could not create a valid Safari MCP bridge token: ${err.message}`);
+    throw new Error(`Could not create a valid Safari MCP bridge token: ${err.message}`, { cause: err });
   }
 }
 const BRIDGE_TOKEN = _getBridgeToken();
@@ -1391,7 +1390,7 @@ function _drainOnDisconnect(reason) {
     return;
   }
   // Reject all in-flight requests immediately (instead of waiting for timeout)
-  for (const [id, pending] of _pendingRequests) {
+  for (const [, pending] of _pendingRequests) {
     clearTimeout(pending.timer);
     if (pending.reloadHandoff) _cancelReloadHttpWorkerHandoff(pending.reloadHandoff);
     pending.reject(new Error(`Extension disconnected: ${reason}`));
@@ -1671,7 +1670,7 @@ function _aliasReceipt(oldToken, newToken) {
 }
 function _receiptToken(value) {
   const raw = String(value || "");
-  let token = "";
+  let token;
   if (/^[A-Za-z0-9_-]{24,}$/.test(raw)) token = raw;
   else {
     const legacy = raw.match(/(?:[?#&])mcp-tab=([A-Za-z0-9_-]{24,})(?:[&#]|$)/);
@@ -2134,7 +2133,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
           }
           throw err;
         }
-        if (_preferAppleScript) throw new Error(`Safari profile extension unavailable for "${extensionType}": ${err.message}`);
+        if (_preferAppleScript) throw new Error(`Safari profile extension unavailable for "${extensionType}": ${err.message}`, { cause: err });
         console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
     }
