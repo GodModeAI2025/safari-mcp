@@ -9,6 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { startTransport } from "./transport.js";
 import { currentSessionId } from "./session-context.js";
+import { lanesEnabled, applyLanes, createLaneQueue } from "./lanes.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
 import { textResult, jsonResult, imageResult, errorResult, evalResult } from "./response.js";
@@ -2187,12 +2188,17 @@ const _pkgVersion = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.me
 // stdio mode calls this exactly once, identical to the historical inline server. Tool bodies are
 // unchanged; they close over the module-global safari state, which stays shared across sessions
 // (correct: one physical Safari window). See docs/http-transport-design.md.
+// Opt-in lanes (#76): one queue per process, shared by every per-session server, so two
+// transport sessions presenting the same laneId still serialize against each other.
+const _LANES = lanesEnabled(process.env);
+const _laneQueue = _LANES ? createLaneQueue() : null;
 function buildServer() {
 const server = new McpServer({
   name: "safari-mcp",
   version: _pkgVersion,
   description: "Safari browser automation - lightweight, keeps logins",
 });
+if (_LANES) applyLanes(server, { queue: _laneQueue });
 
 // ========== NAVIGATION ==========
 

@@ -67,6 +67,7 @@
     "response.js",
     "safari.js",
     "session-context.js",
+    "lanes.js",
     "ownership-match.js",
     "ownership-state.js",
     "image-size.js",
