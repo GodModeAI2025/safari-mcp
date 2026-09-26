@@ -7,7 +7,6 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { sessionCtx } from "./session-context.js";
-import { _dropSession } from "./safari.js";
 
 const DEFAULT_HTTP_PORT = 9225; // distinct from the 9224 Safari-extension port
 
@@ -39,9 +38,12 @@ export function planTransport(env = {}) {
 /**
  * @param {() => any} createMcpServer
  * @param {Record<string, string | undefined>} [env]
- * @param {{ observer?: { onSessionInitialized?: (id: string) => void, onRequest?: (id: string) => void, onSessionClosed?: (id: string) => void } }} [opts]
+ * @param {{ observer?: { onSessionInitialized?: (id: string) => void, onRequest?: (id: string) => void, onSessionClosed?: (id: string) => void }, dropSession?: (id: string) => void }} [opts]
  */
-export async function startTransport(createMcpServer, env = process.env, { observer } = {}) {
+// `dropSession` releases per-session state when an HTTP session ends. It defaults to
+// safari.js's _dropSession, loaded lazily so a caller that never touches Safari itself (the
+// profile router) does not start the native helper just by importing this module.
+export async function startTransport(createMcpServer, env = process.env, { observer, dropSession = _defaultDropSession } = {}) {
   const notify = (hook, id) => {
     try { observer?.[hook]?.(id); } catch { /* observability must never break routing */ }
   };
@@ -82,7 +84,7 @@ export async function startTransport(createMcpServer, env = process.env, { obser
         transport.onclose = () => {
           if (transport.sessionId) {
             transports.delete(transport.sessionId);
-            _dropSession(transport.sessionId);
+            dropSession(transport.sessionId);
             notify("onSessionClosed", transport.sessionId);
           }
         };
@@ -141,4 +143,8 @@ export async function startTransport(createMcpServer, env = process.env, { obser
 function isInitialize(body) {
   const msgs = Array.isArray(body) ? body : [body];
   return msgs.some((m) => m && m.method === "initialize");
+}
+
+function _defaultDropSession(id) {
+  import("./safari.js").then((m) => m._dropSession(id)).catch(() => {});
 }

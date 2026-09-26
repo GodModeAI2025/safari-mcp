@@ -48,10 +48,10 @@ if (window.__mcpVersion !== 6) {
       } catch (e) {}
     }
     var iframes = document.querySelectorAll('iframe');
-    for (var i = 0; i < iframes.length; i++) {
+    for (var f = 0; f < iframes.length; f++) {
       try {
-        var doc = iframes[i].contentDocument;
-        if (doc) { var found = doc.querySelector(selector); if (found) return found; }
+        var doc = iframes[f].contentDocument;
+        if (doc) { var inFrame = doc.querySelector(selector); if (inFrame) return inFrame; }
       } catch (e) {}
     }
     return null;
@@ -348,8 +348,8 @@ if (window.__mcpVersion !== 6) {
     }
     if (!best) {
       var allEls = document.querySelectorAll('*');
-      for (var i = 0; i < allEls.length; i++) {
-        var el = allEls[i];
+      for (var q = 0; q < allEls.length; q++) {
+        var el = allEls[q];
         var it = window.mcpNormalizeText(el.innerText);
         if (!it) continue;
         if (exact ? (it !== needle) : !it.includes(needle)) continue;

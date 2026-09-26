@@ -16,7 +16,7 @@ const safari = await import('../safari.js');
 
 let failures = 0;
 function check(name, got, expectFn) {
-  let ok = false;
+  let ok;
   try { ok = expectFn(got); } catch { ok = false; }
   console.log(`  ${ok ? '✅' : '❌'} ${name}  →  ${JSON.stringify(got)}`);
   if (!ok) failures++;

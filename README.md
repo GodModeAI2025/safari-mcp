@@ -23,7 +23,7 @@
 
 [Quick Start](#quick-start) · [All 98 Tools](#tools-98) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
 
-![Safari MCP Demo](https://github.com/achiya-automation/safari-mcp/raw/main/assets/safari-mcp-promo.gif)
+![Safari MCP Demo](assets/safari-mcp-promo.gif)
 
 </div>
 
@@ -359,8 +359,41 @@ mcporter call safari.safari_snapshot laneId="$PI_SESSION_ID"
 - **Re-claim:** state is keyed by the lane, not the connection. Reconnect with the same `laneId` and you're back on your tab; another lane never inherits it.
 - **Serialized:** calls into the same lane run one at a time, in order. Different lanes still run concurrently.
 - **Fails closed:** a call without a valid `laneId` (`[A-Za-z0-9._:-]`, max 128) is rejected. There is no default lane to fall into.
+- **Idle lanes are released:** a lane that makes no calls for `SAFARI_MCP_LANE_IDLE_MS` (default 1 hour, `0` = never) has its server-side state dropped, so arbitrary lane ids cannot grow the process forever. A lane with a call in flight is never released. Its tab stays open, and the next call with that `laneId` starts fresh.
 
 Works over stdio and HTTP. Off by default, so tool schemas don't change unless you opt in. `test/session-cardinality.test.mjs` asserts these invariants in CI, and also checks that a client-caching runner shows up as a single collapsed session there, not in production.
+
+---
+
+## Choosing the Safari profile per call
+
+`SAFARI_PROFILE` binds a whole server to one profile. To pick the profile per call from one MCP entry, run the profile router instead:
+
+```json
+{
+  "mcpServers": {
+    "safari-mcp": {
+      "command": "npx",
+      "args": ["-y", "-p", "safari-mcp", "safari-mcp-profiles"],
+      "env": { "SAFARI_MCP_PROFILES": "Work,Personal" }
+    }
+  }
+}
+```
+
+Every tool then takes an optional `safariProfile` (one of the configured names):
+
+```
+safari_new_tab  { "url": "https://mail.example.com", "safariProfile": "Work" }
+safari_snapshot { "safariProfile": "Work" }
+safari_navigate { "url": "https://example.com" }        ← your ordinary windows
+```
+
+- **One child per profile.** The router starts an ordinary safari-mcp with `SAFARI_PROFILE=<name>` for each profile the first time you use it, so every profile guarantee stays as it is (extension-only routing, verified worker, own tabs and receipts).
+- **Default:** calls without `safariProfile` go to `SAFARI_MCP_DEFAULT_PROFILE`, or to your ordinary windows when that is unset.
+- **Unknown names are refused,** never served by another profile's windows.
+- **Per session:** in HTTP mode (`SAFARI_MCP_HTTP=1`) each MCP session gets its own children, which are shut down when the session ends, so two agents never share a child.
+- The argument is `safariProfile`, not `profile`, because `safari_throttle_network` already has a `profile` parameter.
 
 ---
 
@@ -396,6 +429,10 @@ What the flag deliberately does *not* do:
 | `SAFARI_MCP_HTTP` | off | Run one shared HTTP daemon instead of a process per client (see above). |
 | `SAFARI_MCP_HTTP_PORT` | `9225` | Port for that daemon. |
 | `SAFARI_PROFILE` | unset | Bind sessions to a named Safari profile. Unset = your ordinary windows. |
+| `SAFARI_MCP_PROFILES` | unset | Profile router only (`safari-mcp-profiles`): comma-separated profiles selectable per call via `safariProfile`. |
+| `SAFARI_MCP_DEFAULT_PROFILE` | unset | Profile router only: profile for calls without `safariProfile`. Unset = your ordinary windows. |
+| `SAFARI_MCP_LANES` | off | Require a `laneId` on every tool call and keep tab state per lane (see above). |
+| `SAFARI_MCP_LANE_IDLE_MS` | `3600000` | Release a lane's state after this much silence. `0` = never. |
 | `SAFARI_MCP_ALLOW_USER_TABS` | off | Let `safari_switch_tab` adopt a tab **you** already had open, instead of refusing it (see below). |
 | `SAFARI_MCP_RAISE_ON_NAVIGATE` | off | Let navigation bring Safari to the front, and stop the focus guard from putting your previous app back. |
 | `SAFARI_MCP_SCREENSHOT_MAX_WIDTH` | unset | Downscale every `safari_screenshot` to this pixel width (Retina captures are 2× the viewport). Per-call `maxWidth` overrides it. |

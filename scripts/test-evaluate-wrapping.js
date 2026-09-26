@@ -35,7 +35,7 @@ function check(name, got, want) {
 function runSync(script) {
   const { expr } = _buildEvalExpr(script.trim());
   const wrapped = `(function(){ try { return (${expr}); } catch(__mcpErr) { return 'Error: ' + __mcpErr.message; } })()`;
-  return (0, eval)(wrapped); // eslint-disable-line no-eval
+  return (0, eval)(wrapped);
 }
 
 // Mirror _evaluateAsync(): kick the work off into a page global, poll it.
@@ -49,7 +49,7 @@ async function runAsync(script) {
     `${slot}.val=(__v===undefined||__v===null)?null:(typeof __v==='object'?JSON.stringify(__v):String(__v));` +
     `}catch(__e){${slot}.err=(__e&&__e.message)||String(__e);}` +
     `finally{${slot}.done=true;}})();return 'ok';})()`;
-  const started = (0, eval)(kickoff); // eslint-disable-line no-eval
+  const started = (0, eval)(kickoff);
   if (started !== 'ok') throw new Error('kick-off did not return ok: ' + started);
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {

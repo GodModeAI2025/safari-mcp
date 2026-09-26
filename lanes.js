@@ -18,6 +18,9 @@
 //     Different lanes still run concurrently.
 //   - fail-closed: with the flag set, a call without a valid laneId is rejected by the schema
 //     — there is no default lane to fall into.
+//   - idle release: a lane silent for SAFARI_MCP_LANE_IDLE_MS (default 1h, 0 = never) has its
+//     server-side state dropped, so client-chosen ids cannot grow the process without bound.
+//     Its tab stays open (a stray MCP tab costs nothing; closing the wrong one costs work).
 //
 // Default off: schemas and behaviour are unchanged unless SAFARI_MCP_LANES=1.
 
@@ -47,28 +50,81 @@ export const laneIdSchema = z
     "Lane id (required: SAFARI_MCP_LANES=1). Every call with the same laneId shares one tab/ownership state and runs serialized; use one stable id per agent."
   );
 
+// Default idle window before a lane's state is released. Long on purpose: releasing a lane
+// ends its ability to re-claim its tab, so it should only catch lanes that are truly gone.
+export const DEFAULT_LANE_IDLE_MS = 60 * 60 * 1000;
+
+export function laneIdleMs(env = {}) {
+  const raw = env.SAFARI_MCP_LANE_IDLE_MS;
+  if (raw === undefined || raw === "") return DEFAULT_LANE_IDLE_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_LANE_IDLE_MS; // 0 = never release
+}
+
 // Per-key FIFO. Each call chains onto the previous call's settlement (success OR failure), so
-// one failing call never wedges its lane, and the map entry is dropped once the lane is idle.
-export function createLaneQueue() {
+// one failing call never wedges its lane, and the chain entry is dropped once the lane is idle.
+//
+// It also remembers when each lane was last active, so lanes that stop calling can have their
+// server-side state released by sweep(). Lane ids are chosen by clients, so without this every
+// id ever seen would pin a state entry for the life of the process. A lane is only released
+// when nothing of it is queued or running, and only after `idleMs` of silence; a later call
+// with the same laneId simply starts fresh.
+export function createLaneQueue({ idleMs = 0, onRelease = () => {}, now = Date.now } = {}) {
   const tails = new Map();
-  return {
+  const lastActive = new Map();
+  const running = new Map();
+  const bump = (key, d) => {
+    const n = (running.get(key) || 0) + d;
+    if (n > 0) running.set(key, n);
+    else running.delete(key);
+  };
+  const queue = {
     run(key, fn) {
+      lastActive.set(key, now());
+      bump(key, 1);
       const prev = tails.get(key) || Promise.resolve();
       const result = prev.then(() => fn());
-      const tail = result.then(
-        () => {},
-        () => {}
-      );
+      // Settle bookkeeping runs in the first reaction to `result`, ahead of the caller's own
+      // continuation, so a caller that awaited run() never sees its lane still "running".
+      const settle = () => {
+        bump(key, -1);
+        lastActive.set(key, now());
+      };
+      const tail = result.then(settle, settle);
       tails.set(key, tail);
       tail.then(() => {
         if (tails.get(key) === tail) tails.delete(key);
       });
       return result;
     },
+    // Releases every lane idle for at least idleMs. Returns the released keys.
+    sweep() {
+      if (!(idleMs > 0)) return [];
+      const t = now();
+      const released = [];
+      for (const [key, at] of lastActive) {
+        if (running.has(key) || t - at < idleMs) continue;
+        lastActive.delete(key);
+        try { onRelease(key); } catch { /* releasing is best-effort */ }
+        released.push(key);
+      }
+      return released;
+    },
+    // Sweeps periodically without keeping the process alive. Returns a stop function.
+    startSweeper(everyMs = Math.min(Math.max(idleMs / 4, 1000), 60_000)) {
+      if (!(idleMs > 0)) return () => {};
+      const timer = setInterval(() => queue.sweep(), everyMs);
+      timer.unref?.();
+      return () => clearInterval(timer);
+    },
     get size() {
       return tails.size;
     },
+    get lanes() {
+      return lastActive.size;
+    },
   };
+  return queue;
 }
 
 // Wraps server.tool so every registration grows a required laneId and runs inside its lane.

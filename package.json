@@ -5,8 +5,10 @@
   "description": "Safari browser automation for AI agents \u2014 native macOS, zero Chrome overhead. 98 tools via AppleScript + JavaScript.",
   "type": "module",
   "main": "index.js",
+  "types": "index.d.ts",
   "bin": {
-    "safari-mcp": "index.js"
+    "safari-mcp": "index.js",
+    "safari-mcp-profiles": "profile-router.js"
   },
   "scripts": {
     "start": "node index.js",
@@ -15,7 +17,8 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc -p jsconfig.json",
-    "postinstall": "node scripts/postinstall.cjs || true"
+    "postinstall": "node scripts/postinstall.cjs || true",
+    "gen:types": "node scripts/gen-types.mjs"
   },
   "keywords": [
     "safari",
@@ -63,7 +66,9 @@
   ],
   "files": [
     "index.js",
+    "index.d.ts",
     "transport.js",
+    "profile-router.js",
     "response.js",
     "safari.js",
     "session-context.js",

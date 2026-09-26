@@ -909,7 +909,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
         return stdout.trim();
       }
     }
-    throw new Error(`AppleScript error: ${err.stderr || err.message}`);
+    throw new Error(`AppleScript error: ${err.stderr || err.message}`, { cause: err });
   } finally {
     // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
@@ -1521,7 +1521,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
         if (_gs.length < 50000) return await osascriptFast(_gs, { timeout });
         return await osascript(_gs, { timeout });
       }
-      throw new Error('Tab tracking lost — marked tab not found (atomic guard fail-closed). Call safari_new_tab to reopen.');
+      throw new Error('Tab tracking lost — marked tab not found (atomic guard fail-closed). Call safari_new_tab to reopen.', { cause: err });
     }
     // Tab ghost recovery: "Can't get tab X" → re-resolve and retry once.
     // Match both apostrophes — Safari emits a typographic apostrophe (U+2019),
@@ -1553,7 +1553,8 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
         throw new Error(
           `Tab tracking lost during runJS — original tab ${idx} no longer exists, and URL-based resolution failed. ` +
           `Refusing to fall back to "current tab of window" (would target user's active tab). ` +
-          `Call safari_new_tab to open a fresh tab and retry.`
+          `Call safari_new_tab to open a fresh tab and retry.`,
+          { cause: err }
         );
       }
       // No owned tab in this session — front-document fallback is intentional.
@@ -2304,7 +2305,14 @@ let _pinnedWindowOverride = null;
 // click layer to use the global event tap (windowId 0) instead of postToPid.
 let _pinnedForceGlobalTap = false;
 
-async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false }) {
+async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false, activate = "auto" }) {
+  const byElement = !!(ref || selector || text);
+  if (activate === "keyboard" && !byElement) {
+    throw new Error('native_click activate:"keyboard" needs ref, selector or text — a bare x/y point has no element to focus');
+  }
+  // Trusted-delivery probe (#29): armed in the same script that locates the element, so it is
+  // in place before the event is posted. Only for element targets and single clicks.
+  const probe = byElement && !doubleClick && activate !== "mouse" ? `mcpnc${randomUUID().slice(0, 12)}` : null;
 
   // Step 1: Get element's viewport coordinates via JavaScript
   let viewportCoords;
@@ -2315,6 +2323,7 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
         var el = mcpFindRef('${ref}');
         if (!el) return JSON.stringify({error: 'Element not found: ref=${ref}'});
         el.scrollIntoView({block:'center', behavior:'instant'});
+        ${probe ? _nativeClickProbeArmJS(probe) : ''}
         var rect = el.getBoundingClientRect();
         return JSON.stringify({
           x: Math.round(rect.left + rect.width / 2),
@@ -2329,6 +2338,7 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
         var el = document.querySelector('${sel}');
         if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
         el.scrollIntoView({block:'center', behavior:'instant'});
+        ${probe ? _nativeClickProbeArmJS(probe) : ''}
         var rect = el.getBoundingClientRect();
         return JSON.stringify({
           x: Math.round(rect.left + rect.width / 2),
@@ -2343,6 +2353,7 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
         var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
         if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
         el.scrollIntoView({block:'center', behavior:'instant'});
+        ${probe ? _nativeClickProbeArmJS(probe) : ''}
         var rect = el.getBoundingClientRect();
         return JSON.stringify({
           x: Math.round(rect.left + rect.width / 2),
@@ -2390,11 +2401,87 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
   // windowId 0 selects the global tap. Only a pinned click may ask for it: that path
   // has already raised Safari and its own window, so moving the cursor is expected and
   // the focus is handed back afterwards.
+  const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
+
+  if (activate === "keyboard") {
+    const how = await _activateViaKeyboard(probe, geo.windowId);
+    return `Native activated: ${label} via ${how} (keyboard, no mouse event)`;
+  }
+
   await _helperNativeClick(screenX, screenY, doubleClick, _pinnedForceGlobalTap ? 0 : geo.windowId);
 
   const clickType = doubleClick ? 'Native double-clicked' : 'Native clicked';
-  const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
-  return `${clickType}: ${label} at screen (${screenX},${screenY})`;
+  const clicked = `${clickType}: ${label} at screen (${screenX},${screenY})`;
+  if (!probe) return clicked;
+
+  // macOS 26 accepts the mouse CGEvent and reports success, but it may never reach WebKit
+  // content; keyboard CGEvents still do (measured on a Google OAuth consent screen, #29).
+  // So: if the page saw no trusted pointer/mouse/click event, focus the element and press it.
+  await new Promise((r) => setTimeout(r, NATIVE_CLICK_PROBE_MS));
+  const delivered = await runJS(_nativeClickProbeReadJS(probe)).catch(() => "gone");
+  if (_nativeClickNeedsKeyboardFallback(delivered)) {
+    const how = await _activateViaKeyboard(probe, geo.windowId);
+    return `${clicked} — the page saw no trusted mouse event (macOS 26, #29), so it was activated via ${how} instead`;
+  }
+  await runJS(_nativeClickProbeClearJS(probe)).catch(() => {});
+  return clicked;
+}
+
+const NATIVE_CLICK_PROBE_MS = 200;
+
+// Page-side probe. Any trusted pointerdown/mousedown/click after arming proves the OS event
+// reached WebKit. Listeners are window-level capture, so they run before page handlers can
+// stop propagation. The element gets a data attribute so the fallback can find it again.
+function _nativeClickProbeArmJS(token) {
+  return `el.setAttribute('data-mcp-nc','${token}');` +
+    `window.__mcpNC={t:'${token}',trusted:false};` +
+    `if(!window.__mcpNCL){window.__mcpNCL=1;['pointerdown','mousedown','click'].forEach(function(n){` +
+    `window.addEventListener(n,function(e){if(e.isTrusted&&window.__mcpNC)window.__mcpNC.trusted=true;},true);});}`;
+}
+function _nativeClickProbeReadJS(token) {
+  return `(function(){var p=window.__mcpNC;if(!p||p.t!=='${token}')return 'gone';return p.trusted?'1':'0';})()`;
+}
+function _nativeClickProbeClearJS(token) {
+  return `(function(){var e=document.querySelector('[data-mcp-nc="${token}"]');if(e)e.removeAttribute('data-mcp-nc');` +
+    `if(window.__mcpNC&&window.__mcpNC.t==='${token}')window.__mcpNC=null;return 'ok';})()`;
+}
+
+// '0' is the only verdict that triggers the fallback. 'gone' (the page navigated or the probe
+// was replaced) and an unreadable page both mean the click probably did something — pressing
+// again there could submit twice.
+export function _nativeClickNeedsKeyboardFallback(verdict) {
+  return String(verdict).trim() === "0";
+}
+
+// Links and submit-like inputs activate on Return; buttons, checkboxes, radios, switches and
+// anything else keyboard-activatable on Space.
+export function _activationKeyFor({ tag, role, type }) {
+  const t = String(tag || "").toUpperCase();
+  const r = String(role || "").toLowerCase();
+  const ty = String(type || "").toLowerCase();
+  if (t === "A" || r === "link") return "return";
+  if (t === "INPUT" && (ty === "submit" || ty === "image")) return "return";
+  return "space";
+}
+
+async function _activateViaKeyboard(token, windowId) {
+  const raw = await runJS(`(function(){
+    var el=document.querySelector('[data-mcp-nc="${token}"]');
+    if(!el) return JSON.stringify({error:'element no longer on the page'});
+    if(!el.hasAttribute('tabindex') && el.tabIndex < 0) el.setAttribute('tabindex','-1');
+    el.focus({preventScroll:true});
+    var info={focused:document.activeElement===el,tag:el.tagName,role:el.getAttribute('role')||'',type:el.getAttribute('type')||''};
+    el.removeAttribute('data-mcp-nc');
+    if(window.__mcpNC&&window.__mcpNC.t==='${token}')window.__mcpNC=null;
+    return JSON.stringify(info);
+  })()`);
+  let info;
+  try { info = JSON.parse(raw); } catch { throw new Error("native_click keyboard activation: unreadable page reply: " + raw); }
+  if (info.error) throw new Error(`native_click keyboard activation failed: ${info.error}`);
+  if (!info.focused) throw new Error("native_click keyboard activation failed: the element would not take focus, so a key press would go elsewhere");
+  const key = _activationKeyFor(info);
+  await _helperNativeKeyboard(macKeyCodeMap[key], [], windowId);
+  return key === "space" ? "Space" : "Return";
 }
 
 // ========== NATIVE HOVER (OS-level CGEvent mouse move — triggers real :hover and mouseenter) ==========
@@ -3705,7 +3792,7 @@ async function _screenshotFronted({ fullPage }) {
         }
       } catch (e) {
         if (e && e.message === "SCREEN_LOCKED") {
-          throw new Error("screenshot unavailable — the screen is locked, so the capture would be solid black. Unlock the Mac and retry. (Text-based tools — safari_snapshot / safari_read_page / safari_evaluate — work regardless.)");
+          throw new Error("screenshot unavailable — the screen is locked, so the capture would be solid black. Unlock the Mac and retry. (Text-based tools — safari_snapshot / safari_read_page / safari_evaluate — work regardless.)", { cause: e });
         }
         // crop path failed too — fall through to the JS canvas method
       }
@@ -3905,7 +3992,7 @@ async function _screenshotElementFronted({ selector }) {
     } catch (e) {
       await unlink(tmpFile).catch(() => {});
       if (cropFile) await unlink(cropFile).catch(() => {});  // captured path — old code rebuilt it with the wrong timestamp and leaked it
-      throw new Error(`Element screenshot failed: ${e.message}`);
+      throw new Error(`Element screenshot failed: ${e.message}`, { cause: e });
     }
   }
 
@@ -4976,7 +5063,7 @@ export async function savePDF({ path: pdfPath }) {
     } catch (err) {
       // Restore bounds on failure
       await osascript(`tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`).catch(() => {});
-      throw new Error(`PDF screenshot capture failed: ${err.message}`);
+      throw new Error(`PDF screenshot capture failed: ${err.message}`, { cause: err });
     }
 
     // Step 4: Restore original bounds
@@ -4991,7 +5078,7 @@ export async function savePDF({ path: pdfPath }) {
   try {
     await execFileAsync("/usr/bin/sips", ["-s", "format", "pdf", tmpPng, "--out", pdfPath], { timeout: 15000 });
   } catch (err) {
-    throw new Error(`PDF conversion failed: ${err.message}`);
+    throw new Error(`PDF conversion failed: ${err.message}`, { cause: err });
   } finally {
     unlink(tmpPng).catch(() => {});
   }
@@ -5058,7 +5145,7 @@ export async function takeSnapshot({ selector, _gen } = {}) {
         }
         if (el.tagName === 'IMG') return el.alt || '';
         if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
-          var label = el.closest('label') || (el.id && document.querySelector('label[for=\"'+el.id+'\"]'));
+          var label = el.closest('label') || (el.id && document.querySelector('label[for="'+el.id+'"]'));
           if (label) return label.textContent.trim().substring(0,80);
           if (el.placeholder) return el.placeholder;
           if (el.name) return el.name;
@@ -5294,7 +5381,7 @@ export async function getAccessibilityTree({ selector, maxDepth = 5 }) {
 
 // ========== COOKIE CRUD ==========
 
-export async function setCookie({ name, value, domain, path: cookiePath, expires, secure, sameSite, httpOnly }) {
+export async function setCookie({ name, value, domain, path: cookiePath, expires, secure, sameSite, httpOnly: _httpOnly }) {
   const safeName = escJsSingleQuote(name);
   const safeValue = escJsSingleQuote(value);
   // Every interpolated attribute goes through escJsSingleQuote — path/domain/expires
@@ -5648,7 +5735,7 @@ export async function getPerformanceMetrics() {
 
 // ========== NETWORK THROTTLING ==========
 
-export async function throttleNetwork({ profile, latency, downloadKbps, uploadKbps }) {
+export async function throttleNetwork({ profile, latency, downloadKbps, uploadKbps: _uploadKbps }) {
   const profiles = {
     "slow-3g": { latency: 2000, download: 50, upload: 50 },
     "fast-3g": { latency: 560, download: 150, upload: 75 },
@@ -5954,7 +6041,7 @@ export function macosCompatNote(productVersion) {
   }
   const risky = major >= 26;
   const line = risky
-    ? `macOS ${raw} ⚠ raw CGEvent input is filtered on macOS 26+ (issue #29) — clicks are covered: safari_native_click presses via Accessibility first. Native keyboard/hover still ride CGEvent, so prefer safari_evaluate or safari_click for those on trust-gated forms.`
+    ? `macOS ${raw} ⚠ raw CGEvent input is filtered on macOS 26+ (issue #29) — clicks are covered: safari_native_click presses via Accessibility first and, if the page still saw no trusted mouse event, focuses the element and presses Space/Return natively (keyboard CGEvents do reach WebKit). Native hover still rides mouse CGEvents, so prefer safari_evaluate or safari_click for hover-gated UI.`
     : `macOS ${raw} — CGEvent native input supported.`;
   return { version: raw, major, risky, line };
 }
@@ -5964,7 +6051,7 @@ export async function doctor() {
   const add = (ok, label, detail, fix) => checks.push({ ok, label, detail, fix: ok ? null : fix });
 
   // 1. Safari running
-  let safariUp = false;
+  let safariUp;
   try {
     const { stdout } = await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
     safariUp = stdout.trim().length > 0;
@@ -5972,7 +6059,7 @@ export async function doctor() {
   add(safariUp, "Safari running", safariUp ? "Safari process is up" : "Safari is not running", "Open Safari, then retry.");
 
   // 2. Apple Events / Automation — the bridge every AppleScript tool uses
-  let aeOk = false, aeDetail = "";
+  let aeOk = false, aeDetail;
   try {
     const out = await osascript(`tell application "Safari" to return (count of windows) as string`, { timeout: 5000 });
     aeOk = /^\d+$/.test(String(out).trim());
@@ -6009,7 +6096,7 @@ export async function doctor() {
     `System Settings > Privacy & Security > Screen & System Audio Recording → enable ${process.ppid === 1 ? `node at ${process.execPath} (this server runs under launchd)` : "the terminal/IDE that launched this server"}.`);
 
   // 6. Helper codesign identity — a stale/ad-hoc id breaks the Accessibility grant on reinstall
-  let idOk = false, idDetail = "";
+  let idOk = false, idDetail;
   const helperPath = join(__dirname, "safari-helper");
   try {
     const res = await execFileAsync("codesign", ["-d", "--verbose=2", helperPath], { timeout: 4000 })

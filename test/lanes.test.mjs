@@ -4,7 +4,7 @@
 import assert from "node:assert";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { lanesEnabled, laneSessionKey, isLaneSessionKey, createLaneQueue, applyLanes, LANE_ID_PATTERN } from "../lanes.js";
+import { lanesEnabled, laneSessionKey, isLaneSessionKey, createLaneQueue, applyLanes, LANE_ID_PATTERN, laneIdleMs, DEFAULT_LANE_IDLE_MS } from "../lanes.js";
 import { currentSessionId } from "../session-context.js";
 
 test("lanes are off unless SAFARI_MCP_LANES is set to something other than 0", () => {
@@ -61,7 +61,63 @@ test("applyLanes adds a required laneId and runs the handler under the lane key"
 test("index.js only applies lanes behind the flag, with one queue shared by every session", () => {
   const src = readFileSync(new URL("../index.js", import.meta.url), "utf8");
   assert.match(src, /const _LANES = lanesEnabled\(process\.env\);/);
-  assert.match(src, /const _laneQueue = _LANES \? createLaneQueue\(\) : null;/);
+  assert.match(src, /const _laneQueue = _LANES\s*\? createLaneQueue\(\{/);
+  assert.match(src, /idleMs: laneIdleMs\(process\.env\)/);
+  assert.match(src, /safari\._dropSession\(key\);/, "a released lane must drop its tab state");
+  assert.match(src, /_activeReceipts\.delete\(`\$\{SESSION_ID\}:\$\{key\}`\);/, "and its active receipt");
+  assert.match(src, /_laneQueue\?\.startSweeper\(\);/);
   const build = src.slice(src.indexOf("function buildServer()"), src.indexOf("// ========== NAVIGATION =========="));
   assert.match(build, /if \(_LANES\) applyLanes\(server, \{ queue: _laneQueue \}\);/);
+});
+
+test("idle window: default 1h, 0 disables release, garbage falls back to the default", () => {
+  assert.equal(laneIdleMs({}), DEFAULT_LANE_IDLE_MS);
+  assert.equal(DEFAULT_LANE_IDLE_MS, 3600000);
+  assert.equal(laneIdleMs({ SAFARI_MCP_LANE_IDLE_MS: "0" }), 0);
+  assert.equal(laneIdleMs({ SAFARI_MCP_LANE_IDLE_MS: "120000" }), 120000);
+  assert.equal(laneIdleMs({ SAFARI_MCP_LANE_IDLE_MS: "soon" }), DEFAULT_LANE_IDLE_MS);
+  assert.equal(laneIdleMs({ SAFARI_MCP_LANE_IDLE_MS: "-5" }), DEFAULT_LANE_IDLE_MS);
+});
+
+test("sweep releases only lanes idle past the window, never one with work in flight", async () => {
+  let t = 0;
+  const released = [];
+  const q = createLaneQueue({ idleMs: 1000, now: () => t, onRelease: (k) => released.push(k) });
+  await q.run("lane:old", async () => {});
+  t = 500;
+  await q.run("lane:recent", async () => {});
+  let finish;
+  const busy = q.run("lane:busy", () => new Promise((r) => { finish = r; }));
+  await new Promise((r) => setImmediate(r)); // let the queued call start
+  t = 1400;
+  assert.deepEqual(q.sweep(), ["lane:old"], "only the lane silent for >= idleMs goes");
+  t = 10_000;
+  assert.deepEqual(q.sweep(), ["lane:recent"], "a running lane is never released, however old");
+  finish();
+  await busy;
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(q.sweep(), [], "its idle clock restarts when the call finishes");
+  t = 11_000;
+  assert.deepEqual(q.sweep(), ["lane:busy"]);
+  assert.deepEqual(released, ["lane:old", "lane:recent", "lane:busy"]);
+  assert.equal(q.lanes, 0);
+});
+
+test("idleMs 0 never releases and starts no timer", async () => {
+  let t = 0;
+  const q = createLaneQueue({ idleMs: 0, now: () => t, onRelease: () => assert.fail("released") });
+  await q.run("lane:a", async () => {});
+  t = 1e12;
+  assert.deepEqual(q.sweep(), []);
+  const stop = q.startSweeper();
+  stop();
+});
+
+test("a throwing release hook does not stop the sweep", async () => {
+  let t = 0;
+  const q = createLaneQueue({ idleMs: 10, now: () => t, onRelease: () => { throw new Error("x"); } });
+  await q.run("lane:a", async () => {});
+  await q.run("lane:b", async () => {});
+  t = 100;
+  assert.deepEqual(q.sweep().sort(), ["lane:a", "lane:b"]);
 });
