@@ -26,7 +26,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { startTransport } from "./transport.js";
 import { currentSessionId } from "./session-context.js";
 
@@ -95,6 +95,28 @@ export function childEnv(base, profileKey) {
   return env;
 }
 
+// Forwarded calls must outlive the child's own budgets. The SDK's default request timeout is
+// 60s, but a child lets long commands run for max(4× their timeout, 180s) plus slack, and tools
+// take caller-chosen timeouts (safari_navigate { timeout: 90000 }). A router that gave up first
+// would fail calls plain safari-mcp completes. Floor: 10 minutes; scaled by a caller timeout.
+export const FORWARD_TIMEOUT_FLOOR_MS = 10 * 60 * 1000;
+export function forwardTimeoutMs(args = {}) {
+  const t = Number(args && args.timeout);
+  const scaled = Number.isFinite(t) && t > 0 ? Math.max(t * 4, 180000) + 60000 : 0;
+  return Math.max(FORWARD_TIMEOUT_FLOOR_MS, scaled);
+}
+
+// `npx safari-mcp-profiles` runs this file through node_modules/.bin — a symlink — so argv[1]
+// is the link, not this file. Compare real paths, or the router silently never starts.
+export function isMainModule(moduleUrl, argv1) {
+  if (!argv1) return false;
+  try {
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
 export function createProfileRouter({
   env = process.env,
   childCommand = env.SAFARI_MCP_PROFILE_CHILD ? [process.execPath, env.SAFARI_MCP_PROFILE_CHILD] : [process.execPath, join(HERE, "index.js")],
@@ -118,8 +140,17 @@ export function createProfileRouter({
     let children = sessions.get(sessionId);
     if (!children) sessions.set(sessionId, (children = new Map()));
     if (!children.has(profileKey)) {
-      const p = spawn(profileKey);
-      p.catch(() => children.delete(profileKey)); // a failed spawn may be retried by the next call
+      const p = spawn(profileKey).then((child) => {
+        // A child that dies AFTER connecting (crash, killed, Safari relaunch) must be replaced,
+        // not left in the map answering "Not connected" for the rest of the session.
+        child.client.onclose = () => {
+          if (children.get(profileKey) === p) children.delete(profileKey);
+        };
+        return child;
+      });
+      p.catch(() => {
+        if (children.get(profileKey) === p) children.delete(profileKey); // retried by the next call
+      });
       children.set(profileKey, p);
     }
     return children.get(profileKey);
@@ -151,7 +182,7 @@ export function createProfileRouter({
       { capabilities: { tools: {} } }
     );
     server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await listTools() }));
-    server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       const { [PROFILE_ARG]: requested, ...args } = req.params.arguments || {};
       let key;
       try {
@@ -160,7 +191,10 @@ export function createProfileRouter({
         return { content: [{ type: "text", text: e.message }], isError: true };
       }
       const { client } = await childFor(currentSessionId(), key);
-      return client.callTool({ name: req.params.name, arguments: args });
+      return client.callTool({ name: req.params.name, arguments: args }, undefined, {
+        timeout: forwardTimeoutMs(args),
+        signal: extra?.signal, // the caller cancelling cancels the forwarded call too
+      });
     });
     // stdio has one session for the life of the process; tie the children to it.
     const sid = currentSessionId();
@@ -177,7 +211,7 @@ export function createProfileRouter({
   };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   const router = createProfileRouter();
   const handle = await startTransport(router.buildServer, process.env, {
     // In HTTP mode each MCP session owns its children; release them with the session.

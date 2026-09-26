@@ -11,7 +11,11 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startTransport } from "../transport.js";
-import { planProfiles, resolveProfile, withProfileArg, childEnv, createProfileRouter } from "../profile-router.js";
+import { planProfiles, resolveProfile, withProfileArg, childEnv, createProfileRouter, isMainModule, forwardTimeoutMs, FORWARD_TIMEOUT_FLOOR_MS } from "../profile-router.js";
+import { mkdtempSync, symlinkSync, rmSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const STUB = fileURLToPath(new URL("./fixtures/profile-child-stub.mjs", import.meta.url));
 
@@ -121,4 +125,76 @@ test("the router argument cannot collide with a real tool argument", async () =>
   const { readFileSync } = await import("node:fs");
   const idx = readFileSync(new URL("../index.js", import.meta.url), "utf8");
   assert.ok(!/\bsafariProfile\s*:/.test(idx), "a tool declares safariProfile — rename the router argument");
+});
+
+const ROUTER = fileURLToPath(new URL("../profile-router.js", import.meta.url));
+
+test("isMainModule sees through the npm .bin symlink", () => {
+  const dir = mkdtempSync(join(tmpdir(), "safari-mcp-bin-"));
+  try {
+    const link = join(dir, "safari-mcp-profiles");
+    symlinkSync(ROUTER, link);
+    const url = new URL("../profile-router.js", import.meta.url).href;
+    assert.equal(isMainModule(url, link), true, "a symlinked launch must count as main");
+    assert.equal(isMainModule(url, ROUTER), true);
+    assert.equal(isMainModule(url, fileURLToPath(new URL("../index.js", import.meta.url))), false);
+    assert.equal(isMainModule(url, undefined), false);
+    assert.equal(isMainModule(url, join(dir, "missing")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("launched through a symlink (as npx does), the router actually serves", { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "safari-mcp-bin-"));
+  const link = join(dir, "safari-mcp-profiles");
+  symlinkSync(ROUTER, link);
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [link],
+    env: { ...process.env, SAFARI_MCP_PROFILES: "Work", SAFARI_MCP_PROFILE_CHILD: STUB },
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "npx-like", version: "0.0.0" });
+  try {
+    await client.connect(transport, { timeout: 15_000 });
+    const out = await who(client, { safariProfile: "Work" });
+    assert.equal(out.profile, "Work");
+  } finally {
+    await client.close().catch(() => {});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a child that dies after connecting is replaced on the next call", { timeout: 60_000 }, async () => {
+  const { router, handle, connect } = await routerOverHttp({ SAFARI_MCP_PROFILES: "Work" });
+  const { client } = await connect();
+  try {
+    const first = await who(client, { safariProfile: "Work" });
+    process.kill(first.pid, "SIGKILL");
+    let second;
+    for (let i = 0; i < 50; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      second = await who(client, { safariProfile: "Work" }).catch((e) => ({ error: String(e) }));
+      if (second.pid) break;
+    }
+    assert.ok(second.pid, `profile stayed dead: ${JSON.stringify(second)}`);
+    assert.notEqual(second.pid, first.pid, "a fresh child must serve the profile");
+    assert.equal(second.profile, "Work");
+  } finally {
+    await client.close();
+    await router.closeAll();
+    await handle.close();
+  }
+});
+
+test("forwarded calls outlive the SDK's 60s default and the child's own budget", () => {
+  assert.equal(FORWARD_TIMEOUT_FLOOR_MS, 600000);
+  assert.equal(forwardTimeoutMs({}), 600000);
+  assert.equal(forwardTimeoutMs({ timeout: 90000 }), 600000, "safari_navigate { timeout: 90000 } fits the floor");
+  assert.equal(forwardTimeoutMs({ timeout: 300000 }), 300000 * 4 + 60000, "long caller timeouts scale past the floor");
+  assert.equal(forwardTimeoutMs({ timeout: "abc" }), 600000);
+  const src = readFileSync(ROUTER, "utf8");
+  assert.match(src, /client\.callTool\(\{ name: req\.params\.name, arguments: args \}, undefined, \{\n\s*timeout: forwardTimeoutMs\(args\),/);
+  assert.match(src, /signal: extra\?\.signal/);
 });
