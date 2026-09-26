@@ -23,7 +23,7 @@
 
 [Quick Start](#quick-start) · [All 98 Tools](#tools-98) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
 
-![Safari MCP Demo](https://github.com/achiya-automation/safari-mcp/raw/main/assets/safari-mcp-promo.gif)
+![Safari MCP Demo](assets/safari-mcp-promo.gif)
 
 </div>
 
