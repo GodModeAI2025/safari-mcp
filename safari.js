@@ -3737,11 +3737,57 @@ async function _screenshotFronted({ fullPage }) {
       return dataUrl;
     }
 
-    // Final fallback: throw with clear message for the retry logic in index.js
-    throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen & System Audio Recording, then restart Safari.");
+    // Final fallback: throw with clear message for the retry logic in index.js.
+    // Say WHICH grant is missing and WHO needs it (#14) instead of guessing "may have been lost".
+    const pf = await _helperPreflight().catch(() => null);
+    const hostApp = await _responsibleHostApp().catch(() => null);
+    throw new Error(_screenshotFailureMessage({ screenRecording: pf ? pf.screenRecording : undefined, hostApp }));
   } finally {
     await unlink(tmpFile).catch(() => {});
   }
+}
+
+// #14: "I granted Screen Recording to Safari and VS Code, restarted everything, still fails."
+// The old message always blamed a lost permission, which sent people toggling grants that
+// were never the problem (macOS 26 also breaks `screencapture -l` with the grant intact).
+// macOS grants Screen Recording to the RESPONSIBLE app — the .app that launched the process
+// chain (VS Code, Terminal, Claude) — not to Safari, and the helper checks its own grant with
+// CGPreflightScreenCaptureAccess. So: report what the preflight actually says, and name the
+// app whose grant applies. Pure, so the wording is testable without a Mac.
+export function _screenshotFailureMessage({ screenRecording, hostApp } = {}) {
+  const who = hostApp ? `"${hostApp}" (the app that launched safari-mcp)` : "the app that launched safari-mcp (your terminal or IDE, not Safari)";
+  const pane = "System Settings → Privacy & Security → Screen & System Audio Recording";
+  const alt = "Text-based tools (safari_snapshot / safari_read_page / safari_evaluate) work without it.";
+  if (screenRecording === false) {
+    return `screencapture failed — Screen Recording is NOT granted. Enable it for ${who} and for safari-helper in ${pane}, then fully quit that app with Cmd+Q and reopen it (macOS applies the grant at launch; closing the window is not enough). Granting it to Safari does not help. ${alt}`;
+  }
+  if (screenRecording === true) {
+    return `screencapture failed although Screen Recording IS granted — this is not a permission problem, so re-granting will not fix it. On macOS 26 window capture can fail with the grant intact; also check that the Safari window is on screen and the Mac is unlocked. If ${who} was granted only after it started, Cmd+Q and reopen it once. ${alt}`;
+  }
+  return `screencapture failed — Screen Recording may be missing. Enable it for ${who} and for safari-helper in ${pane}, then Cmd+Q and reopen that app. Run safari_doctor to see the actual grant state. ${alt}`;
+}
+
+// "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper"
+// → "Visual Studio Code": the OUTERMOST .app is the one TCC attributes the grant to.
+export function _appNameFromCommPath(comm) {
+  const m = /\/([^/]+)\.app(?:\/|$)/.exec(String(comm || ""));
+  return m ? m[1] : null;
+}
+
+// Walk the parent chain to the first process that lives inside an .app bundle.
+async function _responsibleHostApp() {
+  if (process.platform !== "darwin") return null;
+  let pid = process.ppid;
+  for (let hop = 0; hop < 12 && pid > 1; hop++) {
+    const { stdout } = await execFileAsync("/bin/ps", ["-o", "ppid=,comm=", "-p", String(pid)], { timeout: 2000 });
+    const line = String(stdout).trim();
+    const sp = line.indexOf(" ");
+    if (sp < 0) return null;
+    const app = _appNameFromCommPath(line.slice(sp + 1).trim());
+    if (app) return app;
+    pid = parseInt(line.slice(0, sp), 10);
+  }
+  return null;
 }
 
 // ========== ELEMENT SCREENSHOT ==========
