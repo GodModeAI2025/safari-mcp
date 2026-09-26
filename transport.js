@@ -31,7 +31,20 @@ export function planTransport(env = {}) {
 // state lives at module scope and is shared across sessions (correct — one physical Safari window),
 // so per-session servers still drive the same Safari. stdio calls the factory exactly once, so its
 // path is behaviourally identical to the historical inline `new McpServer(); connect(stdio)`.
-export async function startTransport(createMcpServer, env = process.env) {
+//
+// `observer` (optional) sees the identity chain at the server's edge — the hop #84 asks CI to
+// prove: onSessionInitialized(id) when a client is issued an Mcp-Session-Id, onRequest(id) for
+// every request routed to a live session, onSessionClosed(id) when one ends. Purely
+// observational; a throwing observer is swallowed so it can never break routing.
+/**
+ * @param {() => any} createMcpServer
+ * @param {Record<string, string | undefined>} [env]
+ * @param {{ observer?: { onSessionInitialized?: (id: string) => void, onRequest?: (id: string) => void, onSessionClosed?: (id: string) => void } }} [opts]
+ */
+export async function startTransport(createMcpServer, env = process.env, { observer } = {}) {
+  const notify = (hook, id) => {
+    try { observer?.[hook]?.(id); } catch { /* observability must never break routing */ }
+  };
   const plan = planTransport(env);
 
   if (plan.kind === "stdio") {
@@ -63,10 +76,15 @@ export async function startTransport(createMcpServer, env = process.env) {
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (id) => {
             transports.set(id, transport);
+            notify("onSessionInitialized", id);
           },
         });
         transport.onclose = () => {
-          if (transport.sessionId) { transports.delete(transport.sessionId); _dropSession(transport.sessionId); }
+          if (transport.sessionId) {
+            transports.delete(transport.sessionId);
+            _dropSession(transport.sessionId);
+            notify("onSessionClosed", transport.sessionId);
+          }
         };
         const server = createMcpServer(); // fresh server per session (McpServer is single-connection)
         await server.connect(transport);
@@ -93,6 +111,7 @@ export async function startTransport(createMcpServer, env = process.env) {
         return;
       }
 
+      if (sid) notify("onRequest", sid);
       await sessionCtx.run({ sessionId: sid ?? "_init" }, () => transport.handleRequest(req, res, body));
     } catch {
       if (!res.headersSent) {
@@ -109,7 +128,8 @@ export async function startTransport(createMcpServer, env = process.env) {
 
   return {
     kind: "http",
-    port: plan.port,
+    // The bound port, not the requested one — SAFARI_MCP_HTTP_PORT=0 picks a free port.
+    port: /** @type {import("node:net").AddressInfo} */ (httpServer.address()).port,
     async close() {
       for (const t of transports.values()) await t.close().catch(() => {});
       await new Promise((r) => httpServer.close(r));

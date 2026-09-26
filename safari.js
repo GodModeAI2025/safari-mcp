@@ -1314,11 +1314,50 @@ const NATIVE_TAB_SETTLE_MS = 120; // let the selected tab paint before the event
 // between keystrokes, so nested calls run inside the selection the outermost one took.
 let _tabFrontedDepth = 0;
 
+// #64: a native event is an OS-level click or keystroke — it lands on whatever tab is
+// selected, and no page-side identity guard can refuse it after the fact. So a session that
+// owns a tab must PROVE which tab is its own before anything is fronted or fired:
+//   - activeTabIndex is a cached coordinate; the user opening/closing tabs shifts it under
+//     us (the #54 precondition). It is re-resolved by marker immediately before fronting.
+//   - a session that owns a tab but can no longer find it must refuse. It used to take the
+//     "no owned tab — nothing to front" exit and fire the event at the user's selected tab
+//     (reported: a CGEvent click computed from our Google Form landed on a Chatwoot tab).
+//   - a session that cannot read the selection, or whose fronted tab does not carry its
+//     marker, must refuse too — firing blind is the guess the ownership guard exists to stop.
+// A session that never owned a tab keeps the historical behaviour: act on the front tab.
+export function _nativeFrontingPlan({ ownsTab, hadMarker, markerAfter, resolvedIdx }) {
+  if (!ownsTab) return resolvedIdx ? { action: "front", idx: resolvedIdx } : { action: "unfronted" };
+  if (hadMarker && !markerAfter) return { action: "refuse" }; // marker proven gone
+  if (!resolvedIdx) return { action: "refuse" };
+  return { action: "front", idx: resolvedIdx };
+}
+
+function _nativeTrackingLostError(why) {
+  return new Error(
+    `Tab tracking lost before a native (OS-level) event — ${why}. Refusing to fire it: ` +
+    `it would land on whichever tab is selected, which is usually the user's. ` +
+    `Call safari_new_tab (or safari_switch_tab to a tab this session opened) and retry.`
+  );
+}
+
 async function _withTargetTabFronted(fn) {
   if (_tabFrontedDepth > 0) return await fn(); // already inside a fronted section
 
-  const idx = _st().activeTabIndex;
-  if (!idx) return await fn(); // no owned tab — nothing to front
+  const s = _st();
+  const ownsTab = !!(s.hasOwnedTab || s.activeTabMarker);
+  const hadMarker = !!s.activeTabMarker;
+  let resolvedIdx = s.activeTabIndex;
+  if (ownsTab) {
+    try {
+      resolvedIdx = await resolveActiveTab();
+    } catch (_e) {
+      resolvedIdx = null;
+    }
+  }
+  const plan = _nativeFrontingPlan({ ownsTab, hadMarker, markerAfter: !!_st().activeTabMarker, resolvedIdx });
+  if (plan.action === "refuse") throw _nativeTrackingLostError("this session's tab could not be re-identified by its marker");
+  if (plan.action === "unfronted") return await fn(); // never owned a tab — nothing to front
+  const idx = plan.idx;
 
   const winRef = getTargetWindowRef();
   let prev;
@@ -1327,12 +1366,14 @@ async function _withTargetTabFronted(fn) {
       await osascriptFast(`tell application "Safari" to tell ${winRef} to return (index of current tab) as text`)
     );
   } catch (_e) {
-    // Can't read the selection — switching blind risks stranding the user on our tab.
-    // Deliver the event as-is rather than leave the selection somewhere they didn't put it.
+    prev = NaN;
+  }
+  if (!Number.isFinite(prev)) {
+    // Can't read the selection. For a session that owns a tab, firing anyway means firing at
+    // an unknown tab; for one that never did, the event goes to the front tab as it always has.
+    if (ownsTab) throw _nativeTrackingLostError("Safari's selected tab could not be read");
     return await fn();
   }
-
-  if (!Number.isFinite(prev)) return await fn();
 
   // Already selected? Then no switch and no restore — but still mark the section, so nested
   // _helperNative* calls skip re-checking the selection on every keystroke.
@@ -1340,6 +1381,23 @@ async function _withTargetTabFronted(fn) {
   if (mustSwitch) {
     await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${idx}`);
     await new Promise((r) => setTimeout(r, NATIVE_TAB_SETTLE_MS));
+  }
+
+  // Prove the SELECTED tab is ours right before the event fires. resolveActiveTab may have
+  // settled on a URL/domain match, and a tab can move between the resolve and the switch.
+  const marker = _st().activeTabMarker;
+  if (marker) {
+    const safeMarker = marker.replace(/'/g, "\\'");
+    const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
+    const selectedIsOurs = await osascriptFast(
+      `tell application "Safari" to tell ${winRef} to return (do JavaScript "${check}" in current tab)`
+    ).then((r) => String(r).trim() === "1").catch(() => false);
+    if (!selectedIsOurs) {
+      if (mustSwitch) {
+        await osascriptFast(`tell application "Safari" to tell ${winRef} to set current tab to tab ${prev}`).catch(() => {});
+      }
+      throw _nativeTrackingLostError("the selected tab does not carry this session's marker");
+    }
   }
 
   _tabFrontedDepth++;
@@ -3679,11 +3737,57 @@ async function _screenshotFronted({ fullPage }) {
       return dataUrl;
     }
 
-    // Final fallback: throw with clear message for the retry logic in index.js
-    throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen & System Audio Recording, then restart Safari.");
+    // Final fallback: throw with clear message for the retry logic in index.js.
+    // Say WHICH grant is missing and WHO needs it (#14) instead of guessing "may have been lost".
+    const pf = await _helperPreflight().catch(() => null);
+    const hostApp = await _responsibleHostApp().catch(() => null);
+    throw new Error(_screenshotFailureMessage({ screenRecording: pf ? pf.screenRecording : undefined, hostApp }));
   } finally {
     await unlink(tmpFile).catch(() => {});
   }
+}
+
+// #14: "I granted Screen Recording to Safari and VS Code, restarted everything, still fails."
+// The old message always blamed a lost permission, which sent people toggling grants that
+// were never the problem (macOS 26 also breaks `screencapture -l` with the grant intact).
+// macOS grants Screen Recording to the RESPONSIBLE app — the .app that launched the process
+// chain (VS Code, Terminal, Claude) — not to Safari, and the helper checks its own grant with
+// CGPreflightScreenCaptureAccess. So: report what the preflight actually says, and name the
+// app whose grant applies. Pure, so the wording is testable without a Mac.
+export function _screenshotFailureMessage({ screenRecording, hostApp } = {}) {
+  const who = hostApp ? `"${hostApp}" (the app that launched safari-mcp)` : "the app that launched safari-mcp (your terminal or IDE, not Safari)";
+  const pane = "System Settings → Privacy & Security → Screen & System Audio Recording";
+  const alt = "Text-based tools (safari_snapshot / safari_read_page / safari_evaluate) work without it.";
+  if (screenRecording === false) {
+    return `screencapture failed — Screen Recording is NOT granted. Enable it for ${who} and for safari-helper in ${pane}, then fully quit that app with Cmd+Q and reopen it (macOS applies the grant at launch; closing the window is not enough). Granting it to Safari does not help. ${alt}`;
+  }
+  if (screenRecording === true) {
+    return `screencapture failed although Screen Recording IS granted — this is not a permission problem, so re-granting will not fix it. On macOS 26 window capture can fail with the grant intact; also check that the Safari window is on screen and the Mac is unlocked. If ${who} was granted only after it started, Cmd+Q and reopen it once. ${alt}`;
+  }
+  return `screencapture failed — Screen Recording may be missing. Enable it for ${who} and for safari-helper in ${pane}, then Cmd+Q and reopen that app. Run safari_doctor to see the actual grant state. ${alt}`;
+}
+
+// "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper"
+// → "Visual Studio Code": the OUTERMOST .app is the one TCC attributes the grant to.
+export function _appNameFromCommPath(comm) {
+  const m = /\/([^/]+)\.app(?:\/|$)/.exec(String(comm || ""));
+  return m ? m[1] : null;
+}
+
+// Walk the parent chain to the first process that lives inside an .app bundle.
+async function _responsibleHostApp() {
+  if (process.platform !== "darwin") return null;
+  let pid = process.ppid;
+  for (let hop = 0; hop < 12 && pid > 1; hop++) {
+    const { stdout } = await execFileAsync("/bin/ps", ["-o", "ppid=,comm=", "-p", String(pid)], { timeout: 2000 });
+    const line = String(stdout).trim();
+    const sp = line.indexOf(" ");
+    if (sp < 0) return null;
+    const app = _appNameFromCommPath(line.slice(sp + 1).trim());
+    if (app) return app;
+    pid = parseInt(line.slice(0, sp), 10);
+  }
+  return null;
 }
 
 // ========== ELEMENT SCREENSHOT ==========
