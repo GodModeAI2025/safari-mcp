@@ -2466,6 +2466,7 @@ server.tool(
     x: z.coerce.number().optional().describe("Viewport X coordinate"),
     y: z.coerce.number().optional().describe("Viewport Y coordinate"),
     doubleClick: z.boolean().optional().default(false).describe("Double-click instead of single click"),
+    activate: z.enum(["auto", "mouse", "keyboard"]).optional().default("auto").describe("auto (default): mouse click, and if the page saw no trusted mouse event (macOS 26 filters them) focus the element and press Space/Return natively. mouse: mouse only. keyboard: skip the mouse, focus + native key (needs ref/selector/text)."),
   },
   async (args) => {
     // Native click always uses AppleScript path (no extension) — it needs OS-level access.

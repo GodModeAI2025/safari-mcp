@@ -2305,7 +2305,14 @@ let _pinnedWindowOverride = null;
 // click layer to use the global event tap (windowId 0) instead of postToPid.
 let _pinnedForceGlobalTap = false;
 
-async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false }) {
+async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false, activate = "auto" }) {
+  const byElement = !!(ref || selector || text);
+  if (activate === "keyboard" && !byElement) {
+    throw new Error('native_click activate:"keyboard" needs ref, selector or text — a bare x/y point has no element to focus');
+  }
+  // Trusted-delivery probe (#29): armed in the same script that locates the element, so it is
+  // in place before the event is posted. Only for element targets and single clicks.
+  const probe = byElement && !doubleClick && activate !== "mouse" ? `mcpnc${randomUUID().slice(0, 12)}` : null;
 
   // Step 1: Get element's viewport coordinates via JavaScript
   let viewportCoords;
@@ -2316,6 +2323,7 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
         var el = mcpFindRef('${ref}');
         if (!el) return JSON.stringify({error: 'Element not found: ref=${ref}'});
         el.scrollIntoView({block:'center', behavior:'instant'});
+        ${probe ? _nativeClickProbeArmJS(probe) : ''}
         var rect = el.getBoundingClientRect();
         return JSON.stringify({
           x: Math.round(rect.left + rect.width / 2),
@@ -2330,6 +2338,7 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
         var el = document.querySelector('${sel}');
         if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
         el.scrollIntoView({block:'center', behavior:'instant'});
+        ${probe ? _nativeClickProbeArmJS(probe) : ''}
         var rect = el.getBoundingClientRect();
         return JSON.stringify({
           x: Math.round(rect.left + rect.width / 2),
@@ -2344,6 +2353,7 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
         var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
         if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
         el.scrollIntoView({block:'center', behavior:'instant'});
+        ${probe ? _nativeClickProbeArmJS(probe) : ''}
         var rect = el.getBoundingClientRect();
         return JSON.stringify({
           x: Math.round(rect.left + rect.width / 2),
@@ -2391,11 +2401,87 @@ async function _nativeClickImpl({ selector, text, x, y, ref, doubleClick = false
   // windowId 0 selects the global tap. Only a pinned click may ask for it: that path
   // has already raised Safari and its own window, so moving the cursor is expected and
   // the focus is handed back afterwards.
+  const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
+
+  if (activate === "keyboard") {
+    const how = await _activateViaKeyboard(probe, geo.windowId);
+    return `Native activated: ${label} via ${how} (keyboard, no mouse event)`;
+  }
+
   await _helperNativeClick(screenX, screenY, doubleClick, _pinnedForceGlobalTap ? 0 : geo.windowId);
 
   const clickType = doubleClick ? 'Native double-clicked' : 'Native clicked';
-  const label = viewportCoords.tag + (viewportCoords.text ? ` "${viewportCoords.text}"` : '');
-  return `${clickType}: ${label} at screen (${screenX},${screenY})`;
+  const clicked = `${clickType}: ${label} at screen (${screenX},${screenY})`;
+  if (!probe) return clicked;
+
+  // macOS 26 accepts the mouse CGEvent and reports success, but it may never reach WebKit
+  // content; keyboard CGEvents still do (measured on a Google OAuth consent screen, #29).
+  // So: if the page saw no trusted pointer/mouse/click event, focus the element and press it.
+  await new Promise((r) => setTimeout(r, NATIVE_CLICK_PROBE_MS));
+  const delivered = await runJS(_nativeClickProbeReadJS(probe)).catch(() => "gone");
+  if (_nativeClickNeedsKeyboardFallback(delivered)) {
+    const how = await _activateViaKeyboard(probe, geo.windowId);
+    return `${clicked} — the page saw no trusted mouse event (macOS 26, #29), so it was activated via ${how} instead`;
+  }
+  await runJS(_nativeClickProbeClearJS(probe)).catch(() => {});
+  return clicked;
+}
+
+const NATIVE_CLICK_PROBE_MS = 200;
+
+// Page-side probe. Any trusted pointerdown/mousedown/click after arming proves the OS event
+// reached WebKit. Listeners are window-level capture, so they run before page handlers can
+// stop propagation. The element gets a data attribute so the fallback can find it again.
+function _nativeClickProbeArmJS(token) {
+  return `el.setAttribute('data-mcp-nc','${token}');` +
+    `window.__mcpNC={t:'${token}',trusted:false};` +
+    `if(!window.__mcpNCL){window.__mcpNCL=1;['pointerdown','mousedown','click'].forEach(function(n){` +
+    `window.addEventListener(n,function(e){if(e.isTrusted&&window.__mcpNC)window.__mcpNC.trusted=true;},true);});}`;
+}
+function _nativeClickProbeReadJS(token) {
+  return `(function(){var p=window.__mcpNC;if(!p||p.t!=='${token}')return 'gone';return p.trusted?'1':'0';})()`;
+}
+function _nativeClickProbeClearJS(token) {
+  return `(function(){var e=document.querySelector('[data-mcp-nc="${token}"]');if(e)e.removeAttribute('data-mcp-nc');` +
+    `if(window.__mcpNC&&window.__mcpNC.t==='${token}')window.__mcpNC=null;return 'ok';})()`;
+}
+
+// '0' is the only verdict that triggers the fallback. 'gone' (the page navigated or the probe
+// was replaced) and an unreadable page both mean the click probably did something — pressing
+// again there could submit twice.
+export function _nativeClickNeedsKeyboardFallback(verdict) {
+  return String(verdict).trim() === "0";
+}
+
+// Links and submit-like inputs activate on Return; buttons, checkboxes, radios, switches and
+// anything else keyboard-activatable on Space.
+export function _activationKeyFor({ tag, role, type }) {
+  const t = String(tag || "").toUpperCase();
+  const r = String(role || "").toLowerCase();
+  const ty = String(type || "").toLowerCase();
+  if (t === "A" || r === "link") return "return";
+  if (t === "INPUT" && (ty === "submit" || ty === "image")) return "return";
+  return "space";
+}
+
+async function _activateViaKeyboard(token, windowId) {
+  const raw = await runJS(`(function(){
+    var el=document.querySelector('[data-mcp-nc="${token}"]');
+    if(!el) return JSON.stringify({error:'element no longer on the page'});
+    if(!el.hasAttribute('tabindex') && el.tabIndex < 0) el.setAttribute('tabindex','-1');
+    el.focus({preventScroll:true});
+    var info={focused:document.activeElement===el,tag:el.tagName,role:el.getAttribute('role')||'',type:el.getAttribute('type')||''};
+    el.removeAttribute('data-mcp-nc');
+    if(window.__mcpNC&&window.__mcpNC.t==='${token}')window.__mcpNC=null;
+    return JSON.stringify(info);
+  })()`);
+  let info;
+  try { info = JSON.parse(raw); } catch { throw new Error("native_click keyboard activation: unreadable page reply: " + raw); }
+  if (info.error) throw new Error(`native_click keyboard activation failed: ${info.error}`);
+  if (!info.focused) throw new Error("native_click keyboard activation failed: the element would not take focus, so a key press would go elsewhere");
+  const key = _activationKeyFor(info);
+  await _helperNativeKeyboard(macKeyCodeMap[key], [], windowId);
+  return key === "space" ? "Space" : "Return";
 }
 
 // ========== NATIVE HOVER (OS-level CGEvent mouse move — triggers real :hover and mouseenter) ==========
@@ -5955,7 +6041,7 @@ export function macosCompatNote(productVersion) {
   }
   const risky = major >= 26;
   const line = risky
-    ? `macOS ${raw} ⚠ raw CGEvent input is filtered on macOS 26+ (issue #29) — clicks are covered: safari_native_click presses via Accessibility first. Native keyboard/hover still ride CGEvent, so prefer safari_evaluate or safari_click for those on trust-gated forms.`
+    ? `macOS ${raw} ⚠ raw CGEvent input is filtered on macOS 26+ (issue #29) — clicks are covered: safari_native_click presses via Accessibility first and, if the page still saw no trusted mouse event, focuses the element and presses Space/Return natively (keyboard CGEvents do reach WebKit). Native hover still rides mouse CGEvents, so prefer safari_evaluate or safari_click for hover-gated UI.`
     : `macOS ${raw} — CGEvent native input supported.`;
   return { version: raw, major, risky, line };
 }
